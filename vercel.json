@@ -1,5 +1,20 @@
 {
+  "version": 2,
+  "builds": [
+    {
+      "src": "build/server/index.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "public/**",
+      "use": "@vercel/static"
+    }
+  ],
   "routes": [
+    {
+      "src": "/assets/(.*)",
+      "dest": "public/assets/$1"
+    },
     {
       "src": "/(.*)",
       "dest": "build/server/index.js"
