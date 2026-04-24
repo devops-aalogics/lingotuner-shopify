@@ -1,23 +1,20 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "build/server/index.js",
-      "use": "@vercel/node"
-    },
-    {
-      "src": "public/**",
-      "use": "@vercel/static"
+  "buildCommand": "npm run build",
+  "outputDirectory": "build",
+  "framework": null,
+  "functions": {
+    "build/server/index.js": {
+      "runtime": "nodejs22.x"
     }
-  ],
+  },
   "routes": [
     {
       "src": "/assets/(.*)",
-      "dest": "public/assets/$1"
+      "dest": "/build/client/assets/$1"
     },
     {
       "src": "/(.*)",
-      "dest": "build/server/index.js"
+      "dest": "/build/server/index.js"
     }
   ]
 }
