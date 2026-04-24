@@ -2,11 +2,6 @@
   "buildCommand": "npm run build",
   "outputDirectory": "build",
   "framework": null,
-  "functions": {
-    "build/server/index.js": {
-      "runtime": "nodejs22.x"
-    }
-  },
   "routes": [
     {
       "src": "/assets/(.*)",
