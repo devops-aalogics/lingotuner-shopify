@@ -1,23 +1,14 @@
 {
-  "version": 2,
-  "builds": [
+  "buildCommand": "npm run build",
+  "outputDirectory": "build/client",
+  "rewrites": [
     {
-      "src": "build/server/index.js",
-      "use": "@vercel/node"
+      "source": "/assets/(.*)",
+      "destination": "/assets/$1"
     },
     {
-      "src": "public/**",
-      "use": "@vercel/static"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/assets/(.*)",
-      "dest": "public/assets/$1"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "build/server/index.js"
+      "source": "/(.*)",
+      "destination": "/api/index.js"
     }
   ]
 }
