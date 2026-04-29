@@ -11,6 +11,7 @@ type ProductRow = { id: string; numericId: string; title: string; handle: string
 type CategoryRow = { id: string; numericId: string; title: string; handle: string; description: string; seoTitle: string; seoDescription: string };
 type ProductOptionValueRow = { id: string; name: string };
 type ProductOptionRow = { id: string; name: string; optionValues?: ProductOptionValueRow[] };
+type AttributePickerOption = { value: string; label: string };
 type RequestRow = {
   requestUid: string;
   languages: string;
@@ -22,6 +23,7 @@ type RequestRow = {
   isTranslated: boolean;
   createdAt: string;
 };
+type RequestDbRow = Omit<RequestRow, "createdAt"> & { createdAt: Date };
 type RequestLookupRow = {
   requestUid: string;
   languages: string;
@@ -44,6 +46,11 @@ type StoreLocaleRow = {
   primary: boolean;
   published: boolean;
 };
+type AttributeIndexSnapshot = {
+  generatedAt: string;
+  totalProductsScanned: number;
+  attributes: AttributePickerOption[];
+};
 type ActionData = { ok: boolean; intent: string; message: string; requests?: RequestRow[] };
 
 function parseCachedLanguages(payload: string | null | undefined): LanguageOption[] {
@@ -56,83 +63,145 @@ function parseCachedLanguages(payload: string | null | undefined): LanguageOptio
   }
 }
 
+function parseAttributeIndexSnapshot(payload: string | null | undefined): AttributeIndexSnapshot | null {
+  if (!payload) return null;
+  try {
+    const parsed = JSON.parse(payload) as Partial<AttributeIndexSnapshot>;
+    if (!parsed || !Array.isArray(parsed.attributes)) return null;
+    const attributes = parsed.attributes
+      .filter((entry) => entry && typeof entry.value === "string" && typeof entry.label === "string")
+      .map((entry) => ({ value: entry.value.trim(), label: entry.label.trim() }))
+      .filter((entry) => entry.value && entry.label);
+    if (!attributes.length) return null;
+    return {
+      generatedAt: String(parsed.generatedAt ?? ""),
+      totalProductsScanned: Number(parsed.totalProductsScanned ?? 0),
+      attributes,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getLatestAttributeIndexByShop(shop: string): Promise<AttributeIndexSnapshot | null> {
+  const row = await prisma.translationLog.findFirst({
+    where: { shop, action: "attribute_index_snapshot" },
+    orderBy: { createdAt: "desc" },
+    select: { metadata: true },
+  });
+  return parseAttributeIndexSnapshot(row?.metadata);
+}
+
 async function getCachedLanguagesByShop(shop: string): Promise<LanguageOption[]> {
-  const rows = await prisma.$queryRaw<SettingsRow[]>`
-    SELECT fetchedLanguages FROM TranslatorSettings WHERE shop = ${shop} LIMIT 1
-  `;
-  return parseCachedLanguages(rows[0]?.fetchedLanguages);
+  const row = await prisma.translatorSettings.findUnique({
+    where: { shop },
+    select: { fetchedLanguages: true },
+  });
+  return parseCachedLanguages(row?.fetchedLanguages);
 }
 
 async function getApiSettingsByShop(shop: string): Promise<TranslatorApiSettingsRow | null> {
-  const rows = await prisma.$queryRaw<TranslatorApiSettingsRow[]>`
-    SELECT apiKey, apiBaseUrl, translationEngine, enabled
-    FROM TranslatorSettings
-    WHERE shop = ${shop}
-    LIMIT 1
-  `;
-  return rows[0] ?? null;
+  const row = await prisma.translatorSettings.findUnique({
+    where: { shop },
+    select: {
+      apiKey: true,
+      apiBaseUrl: true,
+      translationEngine: true,
+      enabled: true,
+    },
+  });
+  return row ?? null;
 }
 
 async function getLocalRequestsByShop(shop: string): Promise<RequestRow[]> {
-  return prisma.$queryRaw<RequestRow[]>`
-    SELECT requestUid, languages, storeLocale, contentType, itemId, itemTitle, status, isTranslated, createdAt
-    FROM TranslationRequest
-    WHERE shop = ${shop}
-    ORDER BY createdAt DESC, id DESC
-    LIMIT 200
-  `;
+  const rows: RequestDbRow[] = await prisma.translationRequest.findMany({
+    where: { shop },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: 200,
+    select: {
+      requestUid: true,
+      languages: true,
+      storeLocale: true,
+      contentType: true,
+      itemId: true,
+      itemTitle: true,
+      status: true,
+      isTranslated: true,
+      createdAt: true,
+    },
+  });
+  return rows.map((row: RequestDbRow) => ({
+    ...row,
+    createdAt: row.createdAt.toISOString(),
+  }));
 }
 
 async function getLocalRequestByUid(shop: string, requestUid: string): Promise<RequestLookupRow | null> {
-  const rows = await prisma.$queryRaw<RequestLookupRow[]>`
-    SELECT requestUid, languages, storeLocale, contentType, itemId, itemTitle
-    FROM TranslationRequest
-    WHERE shop = ${shop} AND requestUid = ${requestUid}
-    LIMIT 1
-  `;
-  return rows[0] ?? null;
+  const row = await prisma.translationRequest.findUnique({
+    where: {
+      shop_requestUid: { shop, requestUid },
+    },
+    select: {
+      requestUid: true,
+      languages: true,
+      storeLocale: true,
+      contentType: true,
+      itemId: true,
+      itemTitle: true,
+    },
+  });
+  return row ?? null;
 }
 
 async function upsertLocalRequest(
   shop: string,
   request: Omit<RequestRow, "createdAt">,
 ) {
-  await prisma.$executeRaw`
-    INSERT INTO TranslationRequest (shop, requestUid, languages, storeLocale, contentType, itemId, itemTitle, status, isTranslated, createdAt, updatedAt)
-    VALUES (${shop}, ${request.requestUid}, ${request.languages}, ${request.storeLocale}, ${request.contentType}, ${request.itemId}, ${request.itemTitle}, ${request.status}, ${request.isTranslated}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-    ON CONFLICT(shop, requestUid) DO UPDATE SET
-      languages = excluded.languages,
-      storeLocale = COALESCE(excluded.storeLocale, storeLocale),
-      contentType = excluded.contentType,
-      itemId = COALESCE(excluded.itemId, itemId),
-      itemTitle = COALESCE(excluded.itemTitle, itemTitle),
-      status = excluded.status,
-      isTranslated = excluded.isTranslated,
-      updatedAt = CURRENT_TIMESTAMP
-  `;
+  await prisma.translationRequest.upsert({
+    where: {
+      shop_requestUid: { shop, requestUid: request.requestUid },
+    },
+    update: {
+      languages: request.languages,
+      contentType: request.contentType,
+      status: request.status,
+      isTranslated: request.isTranslated,
+      ...(request.storeLocale !== null ? { storeLocale: request.storeLocale } : {}),
+      ...(request.itemId !== null ? { itemId: request.itemId } : {}),
+      ...(request.itemTitle !== null ? { itemTitle: request.itemTitle } : {}),
+    },
+    create: {
+      shop,
+      requestUid: request.requestUid,
+      languages: request.languages,
+      storeLocale: request.storeLocale,
+      contentType: request.contentType,
+      itemId: request.itemId,
+      itemTitle: request.itemTitle,
+      status: request.status,
+      isTranslated: request.isTranslated,
+    },
+  });
 }
 
 async function markTranslated(shop: string, requestUid: string) {
-  await prisma.$executeRaw`
-    UPDATE TranslationRequest
-    SET isTranslated = 1, updatedAt = CURRENT_TIMESTAMP
-    WHERE shop = ${shop} AND requestUid = ${requestUid}
-  `;
+  await prisma.translationRequest.updateMany({
+    where: { shop, requestUid },
+    data: { isTranslated: true },
+  });
 }
 
 async function deleteLocalRequest(shop: string, requestUid: string) {
-  await prisma.$executeRaw`
-    DELETE FROM TranslationRequest
-    WHERE shop = ${shop} AND requestUid = ${requestUid}
-  `;
+  await prisma.translationRequest.deleteMany({
+    where: { shop, requestUid },
+  });
 }
 
 async function updateLocalRequestStatus(shop: string, requestUid: string, status: string) {
-  await prisma.$executeRaw`
-    UPDATE TranslationRequest
-    SET status = ${status}, updatedAt = CURRENT_TIMESTAMP
-    WHERE shop = ${shop} AND requestUid = ${requestUid}
-  `;
+  await prisma.translationRequest.updateMany({
+    where: { shop, requestUid },
+    data: { status },
+  });
 }
 
 function normalizeBaseUrl(url: string) {
@@ -141,6 +210,28 @@ function normalizeBaseUrl(url: string) {
 
 function toFieldKey(input: string) {
   return input.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function isDefaultNonAttributeOption(input: string) {
+  const key = toFieldKey(input);
+  return key === "title";
+}
+
+function attributeFieldLabel(fieldKey: string) {
+  const key = fieldKey.trim().toLowerCase();
+  if (key.startsWith("prod_attr_name_")) {
+    return key
+      .replace("prod_attr_name_", "")
+      .split("_")
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
+  }
+  if (key.startsWith("mf__")) {
+    const [, namespace = "", metafieldKey = ""] = key.split("__");
+    return `Metafield ${namespace}.${metafieldKey}`;
+  }
+  return fieldKey;
 }
 
 function joinApiUrl(baseUrl: string, suffix: string) {
@@ -332,7 +423,7 @@ async function fetchRemoteRequestsFromApi(settings: TranslatorApiSettingsRow) {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  const [productResponse, categoryResponse, requests, cachedLanguages] = await Promise.all([
+  const [productResponse, categoryResponse, metafieldDefinitionsResponse, requests, cachedLanguages, attributeIndex] = await Promise.all([
     admin.graphql(
       `#graphql
       query DashboardProducts {
@@ -367,8 +458,26 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         }
       }`,
     ),
+    admin.graphql(
+      `#graphql
+      query DashboardProductMetafieldDefinitions {
+        metafieldDefinitions(first: 100, ownerType: PRODUCT) {
+          edges {
+            node {
+              name
+              namespace
+              key
+              type {
+                name
+              }
+            }
+          }
+        }
+      }`,
+    ),
     getLocalRequestsByShop(session.shop),
     getCachedLanguagesByShop(session.shop),
+    getLatestAttributeIndexByShop(session.shop),
   ]);
 
   const productJson = (await productResponse.json()) as {
@@ -412,6 +521,57 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       seoDescription: String(edge.node.seo?.description ?? ""),
     })) ?? [];
 
+  const metafieldDefinitionsJson = (await metafieldDefinitionsResponse.json()) as {
+    data?: {
+      metafieldDefinitions?: {
+        edges?: Array<{
+          node?: {
+            name?: string | null;
+            namespace?: string | null;
+            key?: string | null;
+            type?: { name?: string | null } | null;
+          } | null;
+        }>;
+      };
+    };
+  };
+
+  const textMetafieldTypes = new Set([
+    "single_line_text_field",
+    "multi_line_text_field",
+    "rich_text_field",
+  ]);
+  const discoveredAttributeFields: AttributePickerOption[] = [];
+  const seenAttributeValues = new Set<string>();
+  const pushAttribute = (value: string, label: string) => {
+    if (!value || seenAttributeValues.has(value)) return;
+    seenAttributeValues.add(value);
+    discoveredAttributeFields.push({ value, label });
+  };
+
+  const sampledOptionNames = Array.from(
+    new Set(
+      products.flatMap((product) =>
+        (product.options ?? []).map((optionName) => String(optionName ?? "").trim()).filter(Boolean),
+      ),
+    ),
+  ).sort((a, b) => a.localeCompare(b));
+  sampledOptionNames.forEach((optionName) => {
+    if (isDefaultNonAttributeOption(optionName)) return;
+    pushAttribute(`prod_attr_name_${toFieldKey(optionName)}`, `${optionName} (Attribute Name)`);
+  });
+
+  const metafieldDefs = metafieldDefinitionsJson.data?.metafieldDefinitions?.edges ?? [];
+  metafieldDefs.forEach((edge) => {
+    const node = edge.node;
+    const namespace = String(node?.namespace ?? "").trim();
+    const key = String(node?.key ?? "").trim();
+    const name = String(node?.name ?? "").trim();
+    const typeName = String(node?.type?.name ?? "").trim();
+    if (!namespace || !key || !textMetafieldTypes.has(typeName)) return;
+    pushAttribute(`mf__${toFieldKey(namespace)}__${toFieldKey(key)}`, `${name || key} (${namespace}.${key})`);
+  });
+
   let localeAccessLimited = false;
   let storeLocales: StoreLocaleRow[] = [];
 
@@ -437,16 +597,26 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     localeAccessLimited = true;
   }
 
-  if (!storeLocales.length && cachedLanguages.length) {
-    storeLocales = cachedLanguages.map((language) => ({
-      locale: language.code,
-      name: language.name,
-      primary: false,
-      published: true,
-    }));
-  }
+  const attributeFields =
+    attributeIndex?.attributes?.length
+      ? attributeIndex.attributes
+      : discoveredAttributeFields;
 
-  return { products, categories, apiLanguages: cachedLanguages, storeLocales, localeAccessLimited, requests };
+  return {
+    products,
+    categories,
+    apiLanguages: cachedLanguages,
+    storeLocales,
+    localeAccessLimited,
+    requests,
+    discoveredAttributeFields: attributeFields,
+    attributeIndexMeta: attributeIndex
+      ? {
+          generatedAt: attributeIndex.generatedAt,
+          totalProductsScanned: attributeIndex.totalProductsScanned,
+        }
+      : null,
+  };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -520,6 +690,135 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       ok: true,
       intent,
       message: "Statuses refreshed from API.",
+      requests: await getLocalRequestsByShop(session.shop),
+    } satisfies ActionData;
+  }
+
+  if (intent === "sync_attribute_index") {
+    const optionNameSet = new Set<string>();
+    const textMetafieldTypes = new Set(["single_line_text_field", "multi_line_text_field", "rich_text_field"]);
+    let hasNextPage = true;
+    let cursor: string | null = null;
+    let scannedProducts = 0;
+    let pageCount = 0;
+    const maxPages = 600;
+
+    while (hasNextPage && pageCount < maxPages) {
+      const response = await admin.graphql(
+        `#graphql
+        query SyncAttributeIndexProducts($after: String) {
+          products(first: 250, after: $after) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            edges {
+              node {
+                options {
+                  name
+                }
+              }
+            }
+          }
+        }`,
+        { variables: { after: cursor } },
+      );
+      const json = (await response.json()) as {
+        data?: {
+          products?: {
+            pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+            edges?: Array<{ node?: { options?: Array<{ name?: string | null } | null> } | null }>;
+          };
+        };
+      };
+      const page = json.data?.products;
+      const edges = page?.edges ?? [];
+      scannedProducts += edges.length;
+      edges.forEach((edge) => {
+        const options = edge?.node?.options ?? [];
+        options.forEach((option) => {
+          const name = String(option?.name ?? "").trim();
+          if (name) optionNameSet.add(name);
+        });
+      });
+      hasNextPage = Boolean(page?.pageInfo?.hasNextPage);
+      cursor = page?.pageInfo?.endCursor ?? null;
+      pageCount += 1;
+    }
+
+    const metafieldResponse = await admin.graphql(
+      `#graphql
+      query SyncAttributeIndexMetafields {
+        metafieldDefinitions(first: 250, ownerType: PRODUCT) {
+          edges {
+            node {
+              name
+              namespace
+              key
+              type {
+                name
+              }
+            }
+          }
+        }
+      }`,
+    );
+    const metafieldJson = (await metafieldResponse.json()) as {
+      data?: {
+        metafieldDefinitions?: {
+          edges?: Array<{
+            node?: {
+              name?: string | null;
+              namespace?: string | null;
+              key?: string | null;
+              type?: { name?: string | null } | null;
+            } | null;
+          }>;
+        };
+      };
+    };
+
+    const attributes: AttributePickerOption[] = Array.from(optionNameSet)
+      .filter((name) => !isDefaultNonAttributeOption(name))
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => ({
+        value: `prod_attr_name_${toFieldKey(name)}`,
+        label: `${name} (Attribute Name)`,
+      }));
+
+    const seenValues = new Set(attributes.map((entry) => entry.value));
+    (metafieldJson.data?.metafieldDefinitions?.edges ?? []).forEach((edge) => {
+      const node = edge.node;
+      const namespace = String(node?.namespace ?? "").trim();
+      const key = String(node?.key ?? "").trim();
+      const name = String(node?.name ?? "").trim();
+      const typeName = String(node?.type?.name ?? "").trim();
+      if (!namespace || !key || !textMetafieldTypes.has(typeName)) return;
+      const value = `mf__${toFieldKey(namespace)}__${toFieldKey(key)}`;
+      if (seenValues.has(value)) return;
+      seenValues.add(value);
+      attributes.push({ value, label: `${name || key} (${namespace}.${key})` });
+    });
+
+    const snapshot: AttributeIndexSnapshot = {
+      generatedAt: new Date().toISOString(),
+      totalProductsScanned: scannedProducts,
+      attributes,
+    };
+
+    await insertTranslationLog({
+      shop: session.shop,
+      level: "success",
+      contentType: "others",
+      action: "attribute_index_snapshot",
+      message: `Attribute index synced with ${attributes.length} fields from ${scannedProducts} products.`,
+      metadata: JSON.stringify(snapshot),
+    });
+
+    return {
+      ok: true,
+      intent,
+      message: `Attribute index synced (${attributes.length} fields, ${scannedProducts} products scanned).`,
       requests: await getLocalRequestsByShop(session.shop),
     } satisfies ActionData;
   }
@@ -935,6 +1234,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       if (key === "meta_title" || key === "seo_title") translated.metaTitle = block.value;
       if (key === "meta_description" || key === "seo_description") translated.metaDescription = block.value;
     });
+    const optionNameTranslations = blocks
+      .map((block) => {
+        const match = /^prod_attr_name_custom_(.+)$/.exec(block.key.trim().toLowerCase());
+        if (!match) return null;
+        return {
+          optionKey: match[1],
+          value: block.value.trim(),
+        };
+      })
+      .filter(
+        (
+          entry,
+        ): entry is {
+          optionKey: string;
+          value: string;
+        } => Boolean(entry?.optionKey && entry.value),
+      );
     const optionValueTranslations = blocks
       .map((block) => {
         const match = /^prod_attr_custom_(.+)_(\d+)$/.exec(block.key.trim().toLowerCase());
@@ -967,52 +1283,92 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           ...(translated.metaDescription.trim() ? { description: translated.metaDescription.trim() } : {}),
         };
       }
-      if (Object.keys(productInput).length <= 1) {
-        return {
-          ok: false,
-          intent,
-          message: optionValueTranslations.length
-            ? "Attribute value translation for default language is not supported in this flow yet."
-            : "No translated content available to apply on default language.",
-          requests: await getLocalRequestsByShop(session.shop),
-        } satisfies ActionData;
-      }
+      let appliedDefaultProductChanges = 0;
+      let appliedDefaultOptionNameChanges = 0;
 
-      const updateResponse = await admin.graphql(
-        `#graphql
-        mutation ProductUpdateFromTranslation($product: ProductUpdateInput!) {
-          productUpdate(product: $product) {
-            userErrors {
-              field
-              message
+      if (Object.keys(productInput).length > 1) {
+        const updateResponse = await admin.graphql(
+          `#graphql
+          mutation ProductUpdateFromTranslation($product: ProductUpdateInput!) {
+            productUpdate(product: $product) {
+              userErrors {
+                field
+                message
+              }
             }
-          }
-        }`,
-        { variables: { product: productInput } },
-      );
-      const updateJson = (await updateResponse.json()) as {
-        data?: {
-          productUpdate?: {
-            userErrors?: Array<{ field?: string[]; message: string }>;
+          }`,
+          { variables: { product: productInput } },
+        );
+        const updateJson = (await updateResponse.json()) as {
+          data?: {
+            productUpdate?: {
+              userErrors?: Array<{ field?: string[]; message: string }>;
+            };
           };
         };
-      };
-      const userErrors = updateJson.data?.productUpdate?.userErrors ?? [];
-      if (userErrors.length) {
-        await insertTranslationLog({
-          shop: session.shop,
-          level: "error",
-          contentType: "product",
-          action: "fetch_content",
-          message: "Failed to apply translated content to default product language.",
-          requestUid,
-          itemId: requestRow.itemId,
-          responseBody: JSON.stringify(updateJson),
-        });
+        const userErrors = updateJson.data?.productUpdate?.userErrors ?? [];
+        if (userErrors.length) {
+          await insertTranslationLog({
+            shop: session.shop,
+            level: "error",
+            contentType: "product",
+            action: "fetch_content",
+            message: "Failed to apply translated content to default product language.",
+            requestUid,
+            itemId: requestRow.itemId,
+            responseBody: JSON.stringify(updateJson),
+          });
+          return {
+            ok: false,
+            intent,
+            message: userErrors[0]?.message || "Failed to apply translated content to default language.",
+            requests: await getLocalRequestsByShop(session.shop),
+          } satisfies ActionData;
+        }
+        appliedDefaultProductChanges += 1;
+      }
+
+      for (const optionTranslation of optionNameTranslations) {
+        const matchedOption = productOptions.find((option) => toFieldKey(option.name) === optionTranslation.optionKey);
+        if (!matchedOption?.id || !optionTranslation.value) continue;
+        const updateResponse = await admin.graphql(
+          `#graphql
+          mutation ProductOptionNameUpdate($productId: ID!, $option: OptionUpdateInput!) {
+            productOptionUpdate(productId: $productId, option: $option) {
+              userErrors {
+                field
+                message
+              }
+            }
+          }`,
+          {
+            variables: {
+              productId: productGid,
+              option: {
+                id: matchedOption.id,
+                name: optionTranslation.value,
+              },
+            },
+          },
+        );
+        const updateJson = (await updateResponse.json()) as {
+          data?: {
+            productOptionUpdate?: {
+              userErrors?: Array<{ field?: string[]; message: string }>;
+            };
+          };
+        };
+        const userErrors = updateJson.data?.productOptionUpdate?.userErrors ?? [];
+        if (!userErrors.length) {
+          appliedDefaultOptionNameChanges += 1;
+        }
+      }
+
+      if (!appliedDefaultProductChanges && !appliedDefaultOptionNameChanges) {
         return {
           ok: false,
           intent,
-          message: userErrors[0]?.message || "Failed to apply translated content to default language.",
+          message: "No translated content available to apply on default language.",
           requests: await getLocalRequestsByShop(session.shop),
         } satisfies ActionData;
       }
@@ -1023,7 +1379,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         level: "success",
         contentType: "product",
         action: "fetch_content",
-        message: `Translated content applied to default locale ${translationLocale} via product update.`,
+        message:
+          appliedDefaultOptionNameChanges > 0
+            ? `Translated content applied to default locale ${translationLocale}, including ${appliedDefaultOptionNameChanges} attribute name(s).`
+            : `Translated content applied to default locale ${translationLocale} via product update.`,
         requestUid,
         itemId: requestRow.itemId,
         statusCode: response.status,
@@ -1032,7 +1391,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return {
         ok: true,
         intent,
-        message: `Translated content applied on default locale ${translationLocale}.`,
+        message:
+          appliedDefaultOptionNameChanges > 0
+            ? `Translated content applied on default locale ${translationLocale} with ${appliedDefaultOptionNameChanges} attribute name(s).`
+            : `Translated content applied on default locale ${translationLocale}.`,
         requests: await getLocalRequestsByShop(session.shop),
       } satisfies ActionData;
     }
@@ -1149,7 +1511,78 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       } satisfies ActionData;
     }
 
+    let appliedOptionNameCount = 0;
     let appliedOptionValueCount = 0;
+    for (const optionTranslation of optionNameTranslations) {
+      const matchedOption = productOptions.find((option) => toFieldKey(option.name) === optionTranslation.optionKey);
+      if (!matchedOption?.id || !optionTranslation.value) continue;
+
+      try {
+        const translatableResponse = await admin.graphql(
+          `#graphql
+          query OptionNameTranslatableContent($resourceId: ID!) {
+            translatableResource(resourceId: $resourceId) {
+              translatableContent {
+                key
+                digest
+              }
+            }
+          }`,
+          { variables: { resourceId: matchedOption.id } },
+        );
+        const translatableJson = (await translatableResponse.json()) as {
+          data?: {
+            translatableResource?: {
+              translatableContent?: Array<{ key: string; digest: string }>;
+            } | null;
+          };
+        };
+        const nameDigest =
+          (translatableJson.data?.translatableResource?.translatableContent ?? []).find(
+            (entry) => entry.key === "name",
+          )?.digest ?? "";
+        if (!nameDigest) continue;
+
+        const updateResponse = await admin.graphql(
+          `#graphql
+          mutation RegisterOptionNameTranslation($resourceId: ID!, $translations: [TranslationInput!]!) {
+            translationsRegister(resourceId: $resourceId, translations: $translations) {
+              userErrors {
+                field
+                message
+              }
+            }
+          }`,
+          {
+            variables: {
+              resourceId: matchedOption.id,
+              translations: [
+                {
+                  key: "name",
+                  value: optionTranslation.value,
+                  locale: translationLocale,
+                  translatableContentDigest: nameDigest,
+                },
+              ],
+            },
+          },
+        );
+        const updateJson = (await updateResponse.json()) as {
+          data?: {
+            translationsRegister?: {
+              userErrors?: Array<{ field?: string[]; message: string }>;
+            };
+          };
+        };
+        const userErrors = updateJson.data?.translationsRegister?.userErrors ?? [];
+        if (!userErrors.length) {
+          appliedOptionNameCount += 1;
+        }
+      } catch {
+        // Ignore individual option name translation failures and continue.
+      }
+    }
+
     for (const optionTranslation of optionValueTranslations) {
       const matchedOption = productOptions.find((option) => toFieldKey(option.name) === optionTranslation.optionKey);
       const matchedValue = matchedOption?.optionValues?.[optionTranslation.index - 1];
@@ -1221,11 +1654,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
     }
 
-    if (!appliedProductTranslations && !appliedOptionValueCount) {
+    if (!appliedProductTranslations && !appliedOptionNameCount && !appliedOptionValueCount) {
       return {
         ok: false,
         intent,
-        message: "No valid translated fields or attribute values were available to apply for selected locale.",
+        message: "No valid translated fields or attribute names were available to apply for selected locale.",
         requests: await getLocalRequestsByShop(session.shop),
       } satisfies ActionData;
     }
@@ -1237,8 +1670,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       contentType: "product",
       action: "fetch_content",
       message:
-        appliedOptionValueCount > 0
-          ? `Translated content fetched and applied to locale ${translationLocale}, including ${appliedOptionValueCount} attribute value(s).`
+        appliedOptionNameCount > 0
+          ? `Translated content fetched and applied to locale ${translationLocale}, including ${appliedOptionNameCount} attribute name(s).`
+          : appliedOptionValueCount > 0
+            ? `Translated content fetched and applied to locale ${translationLocale}, including ${appliedOptionValueCount} attribute value(s).`
           : `Translated content fetched and applied to locale ${translationLocale}.`,
       requestUid,
       itemId: requestRow.itemId,
@@ -1249,20 +1684,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       ok: true,
       intent,
       message:
-        appliedOptionValueCount > 0
-          ? `Translated content applied for locale ${translationLocale} with ${appliedOptionValueCount} attribute value(s).`
+        appliedOptionNameCount > 0
+          ? `Translated content applied for locale ${translationLocale} with ${appliedOptionNameCount} attribute name(s).`
+          : appliedOptionValueCount > 0
+            ? `Translated content applied for locale ${translationLocale} with ${appliedOptionValueCount} attribute value(s).`
           : `Translated content applied for locale ${translationLocale}.`,
       requests: await getLocalRequestsByShop(session.shop),
     } satisfies ActionData;
   }
 
-  const selectedItems = formData.getAll("selectedItems").map(String);
+  let selectedItems = formData.getAll("selectedItems").map(String);
   const selectedContentType = String(formData.get("selectedContentType") ?? "product").trim().toLowerCase();
   const targetLanguages = formData.getAll("targetLanguages").map(String);
   const selectedStoreLocale = String(formData.get("selectedStoreLocale") ?? "").trim();
   const selectedFields = formData.getAll("selectedFields").map(String);
+  const isAttributeMode = selectedContentType === "attribute" || selectedContentType === "attribute_value";
 
-  if (!selectedItems.length) {
+  if (!selectedItems.length && !isAttributeMode) {
     return { ok: false, intent, message: "Select at least one item before starting translation." } satisfies ActionData;
   }
   if (!targetLanguages.length) {
@@ -1270,6 +1708,37 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
   if (!selectedFields.length) {
     return { ok: false, intent, message: "Select at least one content field." } satisfies ActionData;
+  }
+  if (isAttributeMode && !selectedItems.length) {
+    const attributeProductsResponse = await admin.graphql(
+      `#graphql
+      query AttributeModeProducts {
+        products(first: 50, sortKey: UPDATED_AT, reverse: true) {
+          edges {
+            node {
+              id
+            }
+          }
+        }
+      }`,
+    );
+    const attributeProductsJson = (await attributeProductsResponse.json()) as {
+      data?: {
+        products?: {
+          edges?: Array<{ node?: { id?: string | null } | null }>;
+        };
+      };
+    };
+    selectedItems = (attributeProductsJson.data?.products?.edges ?? [])
+      .map((edge) => String(edge?.node?.id ?? "").trim())
+      .filter(Boolean);
+    if (!selectedItems.length) {
+      return {
+        ok: false,
+        intent,
+        message: "No products available for attribute translation request generation.",
+      } satisfies ActionData;
+    }
   }
 
   const settings = await getApiSettingsByShop(session.shop);
@@ -1342,7 +1811,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     (node): node is NonNullable<typeof node> => Boolean(node),
   );
 
-  if (selectedContentType === "product" && !selectedProducts.length) {
+  if (
+    (selectedContentType === "product" ||
+      selectedContentType === "attribute" ||
+      selectedContentType === "attribute_value") &&
+    !selectedProducts.length
+  ) {
     return { ok: false, intent, message: "Selected products could not be loaded from Shopify." } satisfies ActionData;
   }
   if (selectedContentType === "category" && !selectedCategories.length) {
@@ -1374,8 +1848,42 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           sku: product.variants?.edges?.[0]?.node?.sku ?? "",
           contentType: "product" as const,
         }));
+  const rowsToProcess =
+    selectedContentType === "attribute" || selectedContentType === "attribute_value"
+      ? (() => {
+          const selectedOptionFieldKeys = new Set(
+            selectedFields
+              .map((field) => field.trim().toLowerCase())
+              .filter((field) =>
+                selectedContentType === "attribute_value"
+                  ? field.startsWith("prod_attr_value_")
+                  : field.startsWith("prod_attr_name_"),
+              ),
+          );
+          if (!selectedOptionFieldKeys.size) return rowsForTranslation.slice(0, 1);
+          const matchedRow = rowsForTranslation.find((row) =>
+            row.options.some((option) =>
+              selectedOptionFieldKeys.has(
+                `${
+                  selectedContentType === "attribute_value" ? "prod_attr_value_" : "prod_attr_name_"
+                }${toFieldKey(option.name)}`,
+              ),
+            ),
+          );
+          return matchedRow ? [matchedRow] : [];
+        })()
+      : rowsForTranslation;
 
-  for (const row of rowsForTranslation) {
+  if ((selectedContentType === "attribute" || selectedContentType === "attribute_value") && !rowsToProcess.length) {
+    return {
+      ok: false,
+      intent,
+      message: "Selected attribute names were not found in available products. Pick matching attributes and try again.",
+      requests: await getLocalRequestsByShop(session.shop),
+    } satisfies ActionData;
+  }
+
+  for (const row of rowsToProcess) {
     const blocks: ContentBlock[] = [];
     const hasField = (key: string) => selectedFields.includes(key);
     const sku = row.sku ?? "";
@@ -1389,19 +1897,34 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     row.options.forEach((option) => {
       const safeAttr = toFieldKey(option.name);
-      const selectKey = `prod_attr_value_${safeAttr}`;
+      if (selectedContentType === "attribute_value") {
+        const valueSelectKey = `prod_attr_value_${safeAttr}`;
+        if (!hasField(valueSelectKey)) return;
+        (option.values ?? []).forEach((value, index) => {
+          const cleanValue = String(value ?? "").trim();
+          if (!cleanValue) return;
+          blocks.push({ key: `prod_attr_custom_${safeAttr}_${index + 1}`, name: "Attribute Value", value: cleanValue });
+        });
+        return;
+      }
+      const selectKey = `prod_attr_name_${safeAttr}`;
       if (!hasField(selectKey)) return;
-      (option.values ?? []).forEach((value, index) => {
-        const clean = String(value ?? "").trim();
-        if (!clean) return;
-        blocks.push({ key: `prod_attr_custom_${safeAttr}_${index + 1}`, name: "Attribute Value", value: clean });
-      });
+      const cleanName = String(option.name ?? "").trim();
+      if (!cleanName) return;
+      blocks.push({ key: `prod_attr_name_custom_${safeAttr}`, name: "Attribute Name", value: cleanName });
     });
     if (!blocks.length) continue;
 
     const payload = {
       identifier: Number(row.id.split("/").pop() ?? 0),
-      type: selectedContentType === "category" ? "category" : "product",
+      type:
+        selectedContentType === "category"
+          ? "category"
+          : selectedContentType === "attribute"
+            ? "attribute"
+            : selectedContentType === "attribute_value"
+              ? "attribute"
+            : "product",
       languages: targetLanguages,
       content: blocks,
       engine: settings.translationEngine || undefined,
@@ -1424,13 +1947,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (response.ok) {
       successCount += 1;
       if (requestUid) {
+        const attributeItemTitle =
+          selectedContentType === "attribute" || selectedContentType === "attribute_value"
+            ? selectedFields.map(attributeFieldLabel).filter(Boolean).join(", ")
+            : null;
         await upsertLocalRequest(session.shop, {
           requestUid,
           languages: targetLanguages.join(","),
           storeLocale: selectedStoreLocale || null,
-          contentType: selectedContentType === "category" ? "category" : "product",
+          contentType:
+            selectedContentType === "category"
+              ? "category"
+              : selectedContentType === "attribute"
+                ? "attribute"
+                : selectedContentType === "attribute_value"
+                  ? "attribute_value"
+                : "product",
           itemId: row.id.split("/").pop() ?? row.id,
-          itemTitle: row.title,
+          itemTitle: attributeItemTitle || row.title,
           status: "Pending",
           isTranslated: false,
         });
@@ -1469,23 +2003,52 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     intent,
     message:
       successCount === 0
-        ? `Translation request failed for all selected ${selectedContentType === "category" ? "categories" : "products"}.`
+        ? `Translation request failed for all selected ${
+            selectedContentType === "category"
+              ? "categories"
+              : selectedContentType === "attribute" || selectedContentType === "attribute_value"
+                ? "attribute products"
+                : "products"
+          }.`
         : failedCount > 0
-          ? `Translation started for ${successCount} ${selectedContentType === "category" ? "category" : "product"}(s). ${failedCount} failed.`
-          : `Translation started for ${successCount} ${selectedContentType === "category" ? "category" : "product"}(s).`,
+          ? `Translation started for ${successCount} ${
+              selectedContentType === "category"
+                ? "category"
+                : selectedContentType === "attribute" || selectedContentType === "attribute_value"
+                  ? "attribute product"
+                  : "product"
+            }(s). ${failedCount} failed.`
+          : `Translation started for ${successCount} ${
+              selectedContentType === "category"
+                ? "category"
+                : selectedContentType === "attribute" || selectedContentType === "attribute_value"
+                  ? "attribute product"
+                  : "product"
+            }(s).`,
     requests: await getLocalRequestsByShop(session.shop),
   } satisfies ActionData;
 };
 
 export default function DashboardRoute() {
-  const { products, categories, apiLanguages, storeLocales, localeAccessLimited, requests: initialRequests } =
+  const {
+    products,
+    categories,
+    apiLanguages,
+    storeLocales,
+    localeAccessLimited,
+    requests: initialRequests,
+    discoveredAttributeFields,
+    attributeIndexMeta,
+  } =
     useLoaderData<typeof loader>();
   const translateFetcher = useFetcher<ActionData>();
   const requestFetcher = useFetcher<ActionData>();
   const shopify = useAppBridge();
 
   const [searchTerm, setSearchTerm] = useState("");
-  const [selectedContentType, setSelectedContentType] = useState<"product" | "category">("product");
+  const [selectedContentType, setSelectedContentType] = useState<
+    "product" | "category" | "attribute" | "attribute_value"
+  >("product");
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
   const [selectedLanguages, setSelectedLanguages] = useState<string[]>([]);
   const [selectedStoreLocale, setSelectedStoreLocale] = useState("");
@@ -1521,7 +2084,7 @@ export default function DashboardRoute() {
 
   const selectedProducts = useMemo(
     () =>
-      selectedContentType === "product"
+      selectedContentType !== "category"
         ? products.filter((product) => selectedItems.includes(product.id))
         : [],
     [products, selectedItems, selectedContentType],
@@ -1533,6 +2096,18 @@ export default function DashboardRoute() {
     return Array.from(set);
   }, [selectedProducts]);
 
+  const discoveredAttributeValueFields = useMemo(
+    () =>
+      discoveredAttributeFields
+        .filter((field) => field.value.startsWith("prod_attr_name_"))
+        .filter((field) => field.value !== "prod_attr_name_title")
+        .map((field) => ({
+          value: field.value.replace("prod_attr_name_", "prod_attr_value_"),
+          label: field.label.replace("(Attribute Name)", "(Attribute Value)"),
+        })),
+    [discoveredAttributeFields],
+  );
+
   const fieldOptions = useMemo(
     () =>
       selectedContentType === "category"
@@ -1540,6 +2115,15 @@ export default function DashboardRoute() {
             { value: "name", label: "Category Name" },
             { value: "description", label: "Category Description" },
           ]
+        : selectedContentType === "attribute_value"
+          ? discoveredAttributeValueFields.length
+            ? discoveredAttributeValueFields
+            : dynamicAttributes.map((attr) => ({
+                value: `prod_attr_value_${toFieldKey(attr)}`,
+                label: `${attr} (Attribute Value)`,
+              }))
+        : selectedContentType === "attribute"
+          ? discoveredAttributeFields.filter((field) => field.value !== "prod_attr_name_title")
         : [
             { value: "name", label: "Product Name" },
             { value: "description", label: "Description" },
@@ -1547,9 +2131,9 @@ export default function DashboardRoute() {
             { value: "meta_title", label: "Meta Title" },
             { value: "meta_description", label: "Meta Description" },
             { value: "sku", label: "SKU" },
-            ...dynamicAttributes.map((attr) => ({ value: `prod_attr_value_${toFieldKey(attr)}`, label: attr })),
+            ...dynamicAttributes.map((attr) => ({ value: `prod_attr_name_${toFieldKey(attr)}`, label: `${attr} (Attribute Name)` })),
           ],
-    [dynamicAttributes, selectedContentType],
+    [discoveredAttributeFields, discoveredAttributeValueFields, dynamicAttributes, selectedContentType],
   );
 
   const visibleRequests = useMemo(
@@ -1597,12 +2181,15 @@ export default function DashboardRoute() {
     }
   }, [requestsPage, totalRequestPages]);
   useEffect(() => {
+    if (selectedContentType === "attribute" || selectedContentType === "attribute_value") return;
     setSelectedItems([]);
   }, [selectedContentType]);
   useEffect(() => {
     setSelectedFields(
       selectedContentType === "category"
         ? ["name", "description"]
+        : selectedContentType === "attribute" || selectedContentType === "attribute_value"
+          ? []
         : ["name", "description", "meta_title", "meta_description"],
     );
   }, [selectedContentType]);
@@ -1642,7 +2229,9 @@ export default function DashboardRoute() {
               width: "100%",
               boxSizing: "border-box",
               gridTemplateColumns:
-                "minmax(180px, 0.8fr) minmax(250px, 1.4fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(180px, 1fr)",
+                selectedContentType === "attribute" || selectedContentType === "attribute_value"
+                  ? "minmax(180px, 0.8fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(380px, 2.2fr)"
+                  : "minmax(180px, 0.8fr) minmax(250px, 1.4fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(180px, 1fr)",
               gap: "var(--p-space-400, 16px)",
               alignItems: "start",
             }}
@@ -1666,56 +2255,72 @@ export default function DashboardRoute() {
                   />{" "}
                   Categories
                 </label>
-                <label><input type="radio" disabled /> Attributes</label>
-                <label><input type="radio" disabled /> Options</label>
+                <label>
+                  <input
+                    type="radio"
+                    checked={selectedContentType === "attribute"}
+                    onChange={() => setSelectedContentType("attribute")}
+                  />{" "}
+                  Attribute Names
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    checked={selectedContentType === "attribute_value"}
+                    onChange={() => setSelectedContentType("attribute_value")}
+                  />{" "}
+                  Attribute Values
+                </label>
               </div>
             </div>
 
-            <div>
-              <h4 style={{ margin: "0 0 10px" }}>Select Items to Translate</h4>
-              <input
-                type="text"
-                placeholder={selectedContentType === "category" ? "Search categories..." : "Search products..."}
-                value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
-                style={{ width: "100%", padding: "8px 0", marginBottom: "8px" }}
-              />
-              <div style={{ border: "1px solid #d9d9d9", maxHeight: "340px", overflowY: "auto" }}>
-                <table style={{ borderCollapse: "collapse", width: "100%" }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: "left", padding: "6px", width: "34px" }} />
-                      <th style={{ textAlign: "left", padding: "6px" }}>
-                        {selectedContentType === "category" ? "Category" : "Product"}
-                      </th>
-                      <th style={{ textAlign: "left", padding: "6px", width: "72px" }}>ID</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredItems.map((row) => (
-                      <tr key={row.id}>
-                        <td style={{ padding: "6px" }}>
-                          <input
-                            type="checkbox"
-                            checked={selectedItems.includes(row.id)}
-                            onChange={() => toggleInList(row.id, selectedItems, setSelectedItems)}
-                          />
-                        </td>
-                        <td style={{ padding: "6px" }}>{row.title}</td>
-                        <td style={{ padding: "6px" }}>{row.numericId}</td>
-                      </tr>
-                    ))}
-                    {!filteredItems.length ? (
+            {selectedContentType !== "attribute" && selectedContentType !== "attribute_value" ? (
+              <div>
+                <h4 style={{ margin: "0 0 10px" }}>Select Items to Translate</h4>
+                <input
+                  type="text"
+                  placeholder={selectedContentType === "category" ? "Search categories..." : "Search products..."}
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                  style={{ width: "100%", padding: "8px 0", marginBottom: "8px" }}
+                />
+                <div style={{ border: "1px solid #d9d9d9", maxHeight: "340px", overflowY: "auto" }}>
+                  <table style={{ borderCollapse: "collapse", width: "100%" }}>
+                    <thead>
                       <tr>
-                        <td colSpan={3} style={{ padding: "6px" }}>
-                          {selectedContentType === "category" ? "No categories found." : "No products found."}
-                        </td>
+                        <th style={{ textAlign: "left", padding: "6px", width: "34px" }} />
+                        <th style={{ textAlign: "left", padding: "6px" }}>
+                          {selectedContentType === "category" ? "Category" : "Product"}
+                        </th>
+                        <th style={{ textAlign: "left", padding: "6px", width: "72px" }}>ID</th>
                       </tr>
-                    ) : null}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {filteredItems.map((row) => (
+                        <tr key={row.id}>
+                          <td style={{ padding: "6px" }}>
+                            <input
+                              type="checkbox"
+                              checked={selectedItems.includes(row.id)}
+                              onChange={() => toggleInList(row.id, selectedItems, setSelectedItems)}
+                            />
+                          </td>
+                          <td style={{ padding: "6px" }}>{row.title}</td>
+                          <td style={{ padding: "6px" }}>{row.numericId}</td>
+                        </tr>
+                      ))}
+                      {!filteredItems.length ? (
+                        <tr>
+                          <td colSpan={3} style={{ padding: "6px" }}>
+                            {selectedContentType === "category" ? "No categories found." : "No products found."}
+                          </td>
+                        </tr>
+                      ) : null}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
+            ) : null}
 
             <div>
               <h4 style={{ margin: "0 0 10px" }}>API Target Language(s)</h4>
@@ -1766,13 +2371,19 @@ export default function DashboardRoute() {
               ) : (
                 <s-paragraph>
                   {localeAccessLimited
-                    ? "Store locales scope is missing. Add read_locales scope and reinstall app, or fetch languages in settings."
+                    ? "Store locales scope is missing. Add read_locales scope and reinstall app."
                     : "No published secondary store language found. Add/publish language in Shopify settings first."}
                 </s-paragraph>
               )}
             </div>
 
-            <div>
+            <div
+              style={
+                selectedContentType === "attribute" || selectedContentType === "attribute_value"
+                  ? { gridColumn: "4 / span 1" }
+                  : undefined
+              }
+            >
               <h4 style={{ margin: "0 0 10px" }}>Content fields to include</h4>
               <select
                 multiple
@@ -1791,13 +2402,17 @@ export default function DashboardRoute() {
               <p style={{ marginTop: "8px", color: "#6b7280", fontSize: "13px" }}>
                 {selectedContentType === "product"
                   ? "Select fields to send for translation. Product options appear when a single product is selected."
+                  : selectedContentType === "attribute"
+                    ? "Select attribute fields to send for translation."
+                    : selectedContentType === "attribute_value"
+                      ? "Select attribute value fields to send for translation."
                   : "Select fields to send for category translation."}
               </p>
             </div>
             <s-button
               type="submit"
               variant="primary"
-              disabled={!selectedLanguages.length}
+              disabled={!selectedLanguages.length || !selectedFields.length}
               {...(isSubmittingTranslation ? { loading: true } : {})}
             >
               Start Translation
