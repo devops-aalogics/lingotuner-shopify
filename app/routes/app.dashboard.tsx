@@ -423,7 +423,7 @@ async function fetchRemoteRequestsFromApi(settings: TranslatorApiSettingsRow) {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  const [productResponse, categoryResponse, metafieldDefinitionsResponse, requests, cachedLanguages, attributeIndex] = await Promise.all([
+  const [productResult, categoryResult, metafieldDefinitionsResult, requestsResult, cachedLanguagesResult, attributeIndexResult] = await Promise.allSettled([
     admin.graphql(
       `#graphql
       query DashboardProducts {
@@ -480,7 +480,41 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getLatestAttributeIndexByShop(session.shop),
   ]);
 
-  const productJson = (await productResponse.json()) as {
+  if (
+    productResult.status === "rejected" ||
+    categoryResult.status === "rejected" ||
+    metafieldDefinitionsResult.status === "rejected"
+  ) {
+    await insertTranslationLog({
+      shop: session.shop,
+      level: "error",
+      contentType: "configuration",
+      action: "dashboard_loader_graphql_failed",
+      message: "Failed to fetch one or more Shopify dashboard GraphQL resources.",
+      metadata: {
+        productError:
+          productResult.status === "rejected" ? String(productResult.reason) : null,
+        categoryError:
+          categoryResult.status === "rejected" ? String(categoryResult.reason) : null,
+        metafieldDefinitionsError:
+          metafieldDefinitionsResult.status === "rejected"
+            ? String(metafieldDefinitionsResult.reason)
+            : null,
+      },
+    });
+  }
+
+  const requests = requestsResult.status === "fulfilled" ? requestsResult.value : [];
+  const cachedLanguages =
+    cachedLanguagesResult.status === "fulfilled" ? cachedLanguagesResult.value : [];
+  const attributeIndex =
+    attributeIndexResult.status === "fulfilled" ? attributeIndexResult.value : null;
+
+  const productJson = (
+    productResult.status === "fulfilled"
+      ? await productResult.value.json()
+      : { data: { products: { edges: [] } } }
+  ) as {
     data?: {
       products?: { edges?: Array<{ node: { id: string; title: string; handle: string; options?: Array<{ name: string }> } }> };
     };
@@ -495,7 +529,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       options: (edge.node.options ?? []).map((option) => option.name),
     })) ?? [];
 
-  const categoryJson = (await categoryResponse.json()) as {
+  const categoryJson = (
+    categoryResult.status === "fulfilled"
+      ? await categoryResult.value.json()
+      : { data: { collections: { edges: [] } } }
+  ) as {
     data?: {
       collections?: {
         edges?: Array<{
@@ -521,7 +559,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       seoDescription: String(edge.node.seo?.description ?? ""),
     })) ?? [];
 
-  const metafieldDefinitionsJson = (await metafieldDefinitionsResponse.json()) as {
+  const metafieldDefinitionsJson = (
+    metafieldDefinitionsResult.status === "fulfilled"
+      ? await metafieldDefinitionsResult.value.json()
+      : { data: { metafieldDefinitions: { edges: [] } } }
+  ) as {
     data?: {
       metafieldDefinitions?: {
         edges?: Array<{
@@ -875,6 +917,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const settings = await getApiSettingsByShop(session.shop);
     if (!requestUid || !settings?.enabled) {
       return { ok: false, intent, message: "Missing request ID or settings.", requests: await getLocalRequestsByShop(session.shop) } satisfies ActionData;
+    }
+    if (!selectedShopifyLocale) {
+      return { ok: false, intent, message: "Please select Shopify language first.", requests: await getLocalRequestsByShop(session.shop) } satisfies ActionData;
     }
 
     const endpoint = joinApiUrl(
@@ -1709,6 +1754,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (!selectedFields.length) {
     return { ok: false, intent, message: "Select at least one content field." } satisfies ActionData;
   }
+  if (!selectedStoreLocale) {
+    return { ok: false, intent, message: "Please select Shopify language first." } satisfies ActionData;
+  }
   if (isAttributeMode && !selectedItems.length) {
     const attributeProductsResponse = await admin.graphql(
       `#graphql
@@ -2052,6 +2100,8 @@ export default function DashboardRoute() {
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
   const [selectedLanguages, setSelectedLanguages] = useState<string[]>([]);
   const [selectedStoreLocale, setSelectedStoreLocale] = useState("");
+  const [pendingStoreLocale, setPendingStoreLocale] = useState("");
+  const [isLocaleModalOpen, setIsLocaleModalOpen] = useState(false);
   const [selectedFields, setSelectedFields] = useState<string[]>([
     "name",
     "description",
@@ -2161,13 +2211,20 @@ export default function DashboardRoute() {
   useEffect(() => {
     if (!selectableStoreLocales.length) {
       setSelectedStoreLocale("");
+      setPendingStoreLocale("");
+      setIsLocaleModalOpen(false);
       return;
     }
-    if (
-      !selectedStoreLocale ||
-      !selectableStoreLocales.some((locale) => locale.locale === selectedStoreLocale)
-    ) {
-      setSelectedStoreLocale(selectableStoreLocales[0].locale);
+    if (!selectableStoreLocales.some((locale) => locale.locale === selectedStoreLocale)) {
+      setSelectedStoreLocale("");
+      setPendingStoreLocale("");
+      setIsLocaleModalOpen(true);
+    }
+  }, [selectableStoreLocales, selectedStoreLocale]);
+
+  useEffect(() => {
+    if (selectableStoreLocales.length && !selectedStoreLocale) {
+      setIsLocaleModalOpen(true);
     }
   }, [selectableStoreLocales, selectedStoreLocale]);
 
@@ -2323,7 +2380,7 @@ export default function DashboardRoute() {
             ) : null}
 
             <div>
-              <h4 style={{ margin: "0 0 10px" }}>API Target Language(s)</h4>
+              <h4 style={{ margin: "0 0 10px" }}>Select Language</h4>
               {apiLanguages.length ? (
                 <>
                   <select
@@ -2350,20 +2407,37 @@ export default function DashboardRoute() {
             </div>
 
             <div>
-              <h4 style={{ margin: "0 0 10px" }}>Shopify Language (Apply To)</h4>
+              <h4 style={{ margin: "0 0 10px" }}>Shopify Store</h4>
               {selectableStoreLocales.length ? (
                 <>
-                  <select
-                    value={selectedStoreLocale}
-                    onChange={(event) => setSelectedStoreLocale(event.target.value)}
-                    style={{ width: "100%", minHeight: "42px", padding: "6px" }}
-                  >
-                    {selectableStoreLocales.map((locale) => (
-                      <option key={locale.locale} value={locale.locale}>
-                        {locale.name} ({locale.locale}){locale.primary ? " - Default" : ""}
-                      </option>
-                    ))}
-                  </select>
+                  <input
+                    type="text"
+                    readOnly
+                    value={
+                      selectedStoreLocale
+                        ? `${selectableStoreLocales.find((locale) => locale.locale === selectedStoreLocale)?.name ?? selectedStoreLocale} (${selectedStoreLocale})`
+                        : "No language selected yet"
+                    }
+                    style={{
+                      width: "100%",
+                      minHeight: "42px",
+                      padding: "6px",
+                      boxSizing: "border-box",
+                      background: "#f3f4f6",
+                      color: "#6b7280",
+                      border: "1px solid #d1d5db",
+                      borderRadius: "6px",
+                      cursor: "not-allowed",
+                    }}
+                  />
+                  <div style={{ marginTop: "8px", display: "flex", gap: "8px", alignItems: "center" }}>
+                    <s-button type="button" variant="secondary" onClick={() => {
+                      setPendingStoreLocale(selectedStoreLocale);
+                      setIsLocaleModalOpen(true);
+                    }}>
+                      {selectedStoreLocale ? "Edit language" : "Select language"}
+                    </s-button>
+                  </div>
                   <p style={{ marginTop: "8px", color: "#6b7280", fontSize: "13px" }}>
                     When you click Fetch content, translation is applied only to this Shopify locale.
                   </p>
@@ -2412,7 +2486,7 @@ export default function DashboardRoute() {
             <s-button
               type="submit"
               variant="primary"
-              disabled={!selectedLanguages.length || !selectedFields.length}
+              disabled={!selectedLanguages.length || !selectedFields.length || !selectedStoreLocale}
               {...(isSubmittingTranslation ? { loading: true } : {})}
             >
               Start Translation
@@ -2490,6 +2564,7 @@ export default function DashboardRoute() {
                         {completed && !requestRow.isTranslated ? (
                           <s-button
                             variant="secondary"
+                            disabled={!selectedStoreLocale}
                             onClick={() =>
                               requestFetcher.submit(
                                 {
@@ -2571,6 +2646,70 @@ export default function DashboardRoute() {
           ) : null}
         </s-section>
       </div>
+
+      {isLocaleModalOpen ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(17, 24, 39, 0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 2000,
+            padding: "16px",
+          }}
+        >
+          <div
+            style={{
+              width: "100%",
+              maxWidth: "460px",
+              background: "#fff",
+              borderRadius: "12px",
+              padding: "16px",
+              boxSizing: "border-box",
+            }}
+          >
+            <h3 style={{ margin: "0 0 8px" }}>Select Shopify language first</h3>
+            <p style={{ margin: "0 0 12px", color: "#4b5563", fontSize: "14px" }}>
+              Choose the store language you want to work on. You can change it later using Edit language.
+            </p>
+            <select
+              value={pendingStoreLocale}
+              onChange={(event) => setPendingStoreLocale(event.target.value)}
+              style={{ width: "100%", minHeight: "42px", padding: "6px", marginBottom: "12px" }}
+            >
+              <option value="" disabled>
+                Select language
+              </option>
+              {selectableStoreLocales.map((locale) => (
+                <option key={locale.locale} value={locale.locale}>
+                  {locale.name} ({locale.locale}){locale.primary ? " - Default" : ""}
+                </option>
+              ))}
+            </select>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+              {selectedStoreLocale ? (
+                <s-button type="button" variant="secondary" onClick={() => setIsLocaleModalOpen(false)}>
+                  Cancel
+                </s-button>
+              ) : null}
+              <s-button
+                type="button"
+                variant="primary"
+                disabled={!pendingStoreLocale}
+                onClick={() => {
+                  if (!pendingStoreLocale) return;
+                  setSelectedStoreLocale(pendingStoreLocale);
+                  setIsLocaleModalOpen(false);
+                }}
+              >
+                Save language
+              </s-button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </s-page>
   );
 }
