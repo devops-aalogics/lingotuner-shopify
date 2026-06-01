@@ -4,11 +4,12 @@ import express from "express";
 
 const app = express();
 
-app.use(
+app.all(
+  "*",
   createRequestHandler({
     build,
     mode: process.env.NODE_ENV,
-  })
+  }),
 );
 
 export default app;
