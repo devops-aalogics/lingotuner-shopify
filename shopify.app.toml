@@ -9,7 +9,11 @@ embedded = true
 automatically_update_urls_on_dev = true
 
 [webhooks]
-api_version = "2026-07"
+api_version = "2025-10"
+
+# =========================
+# App lifecycle webhooks
+# =========================
 
 [[webhooks.subscriptions]]
 topics = ["app/uninstalled"]
@@ -22,12 +26,27 @@ uri = "/webhooks/app/scopes_update"
 # Mandatory compliance webhooks (App Store)
 # https://shopify.dev/docs/apps/build/compliance/privacy-law-compliance
 [[webhooks.subscriptions]]
-compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
-uri = "/webhooks/compliance"
+compliance_topics = ["customers/data_request"]
+uri = "/webhooks/customers/data_request"
+
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/redact"]
+uri = "/webhooks/customers/redact"
+
+[[webhooks.subscriptions]]
+compliance_topics = ["shop/redact"]
+uri = "/webhooks/shop/redact"
+
+# =========================
+# ACCESS SCOPES
+# =========================
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "write_products,read_locales,read_translations,write_translations"
+
+# =========================
+# AUTH CALLBACKS
+# =========================
 
 [auth]
 redirect_urls = [
