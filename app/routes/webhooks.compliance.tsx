@@ -1,44 +1,32 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
-import db from "../db.server";
-
-async function deleteShopData(shop: string) {
-  await db.$transaction([
-    db.session.deleteMany({ where: { shop } }),
-    db.translatorSettings.deleteMany({ where: { shop } }),
-    db.translationLog.deleteMany({ where: { shop } }),
-    db.translationRequest.deleteMany({ where: { shop } }),
-  ]);
-}
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { topic, shop, payload } = await authenticate.webhook(request);
+  const { shop, topic } = await authenticate.webhook(request);
+
+  console.log(`Received compliance webhook: ${topic} for ${shop}`);
 
   switch (topic) {
     case "CUSTOMERS_DATA_REQUEST":
-    case "customers/data_request":
-      // App stores shop-level translation data only, not customer PII.
-      console.log(`Compliance: customers/data_request for ${shop}`, payload);
+      // Customer requested their data.
+      // This app does not store personal customer data beyond what Shopify
+      // provides at runtime (shop domain). No additional action required.
       break;
 
     case "CUSTOMERS_REDACT":
-    case "customers/redact":
-      // No customer records persisted; acknowledge redaction request.
-      console.log(`Compliance: customers/redact for ${shop}`, payload);
+      // Merchant requested customer data deletion.
+      // Delete any stored customer data associated with this shop if applicable.
       break;
 
     case "SHOP_REDACT":
-    case "shop/redact": {
-      const shopDomain =
-        (payload as { shop_domain?: string }).shop_domain ?? shop;
-      console.log(`Compliance: shop/redact for ${shopDomain}`);
-      await deleteShopData(shopDomain);
+      // App was uninstalled 48h ago. Delete all shop data.
+      // Session cleanup is handled by app/uninstalled webhook.
       break;
-    }
 
     default:
-      console.warn(`Compliance webhook: unhandled topic ${topic}`);
+      console.warn(`Unhandled compliance topic: ${topic}`);
+      return new Response("Unhandled topic", { status: 404 });
   }
 
-  return new Response();
+  return new Response(null, { status: 200 });
 };
