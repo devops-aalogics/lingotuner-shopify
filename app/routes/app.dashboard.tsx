@@ -5,6 +5,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { insertTranslationLog } from "../lib/translation-log.server";
+import { resolveTranslationEngine } from "../lib/translation-settings.server";
 
 type LanguageOption = { code: string; name: string };
 type ProductRow = { id: string; numericId: string; title: string; handle: string; options: string[] };
@@ -1975,7 +1976,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             : "product",
       languages: targetLanguages,
       content: blocks,
-      engine: settings.translationEngine || undefined,
+      engine: resolveTranslationEngine(settings.translationEngine),
     };
 
     const response = await fetch(endpoint, {
