@@ -1,5 +1,12 @@
 import prisma from "../db.server";
 
+export const DEFAULT_TRANSLATION_ENGINE = "Microsoft";
+
+export function resolveTranslationEngine(engine?: string | null) {
+  const trimmed = String(engine ?? "").trim();
+  return trimmed || DEFAULT_TRANSLATION_ENGINE;
+}
+
 type Level = "success" | "error" | "info";
 
 export async function insertTranslationLog(input: {
