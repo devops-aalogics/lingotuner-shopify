@@ -4,8 +4,7 @@ import { useFetcher, useLoaderData } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { insertTranslationLog } from "../lib/translation-log.server";
-import { resolveTranslationEngine } from "../lib/translation-settings.server";
+import { insertTranslationLog, resolveTranslationEngine } from "../lib/translation-log.server";
 
 type LanguageOption = { code: string; name: string };
 type ProductRow = { id: string; numericId: string; title: string; handle: string; options: string[] };
