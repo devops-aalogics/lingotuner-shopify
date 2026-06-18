@@ -10,23 +10,12 @@ import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
 import { insertTranslationLog } from "../lib/translation-log.server";
+import { resolveTranslationEngine } from "../lib/translation-settings.server";
 
 type LanguageOption = {
   code: string;
   name: string;
 };
-
-type EngineOption = {
-  value: string;
-  label: string;
-};
-
-const FALLBACK_ENGINES: EngineOption[] = [
-  { value: "Microsoft", label: "Microsoft" },
-  { value: "Google", label: "Google" },
-  { value: "DeepL", label: "DeepL" },
-  { value: "Agent", label: "Agent" },
-];
 
 type ActionData = {
   ok: boolean;
@@ -39,7 +28,6 @@ type ActionData = {
     enabled: boolean;
     hasApiKey: boolean;
     maskedApiKey: string;
-    engines: EngineOption[];
     cachedLanguages: LanguageOption[];
   };
   languages?: LanguageOption[];
@@ -95,54 +83,6 @@ function parseLanguages(payload: unknown): LanguageOption[] {
   }
 
   return [];
-}
-
-function parseEngines(payload: unknown): EngineOption[] {
-  const set = new Set<string>();
-  const addValue = (value: unknown) => {
-    const text = String(value ?? "").trim();
-    if (text) set.add(text);
-  };
-
-  const walk = (value: unknown) => {
-    if (Array.isArray(value)) {
-      value.forEach(walk);
-      return;
-    }
-    if (!value || typeof value !== "object") return;
-    const obj = value as Record<string, unknown>;
-
-    addValue(obj.engine);
-    addValue(obj.provider);
-    addValue(obj.translationEngine);
-    addValue(obj.engineProvider);
-
-    if (Array.isArray(obj.engines)) obj.engines.forEach(addValue);
-    if (Array.isArray(obj.providers)) obj.providers.forEach(addValue);
-
-    Object.values(obj).forEach((child) => {
-      if (typeof child === "object") walk(child);
-    });
-  };
-
-  walk(payload);
-
-  return Array.from(set).map((value) => ({
-    value,
-    label: value,
-  }));
-}
-
-function mergeEngines(primary: EngineOption[], secondary: EngineOption[]) {
-  const seen = new Set<string>();
-  const merged: EngineOption[] = [];
-  [...primary, ...secondary].forEach((item) => {
-    const key = item.value.trim().toLowerCase();
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    merged.push(item);
-  });
-  return merged;
 }
 
 type TranslatorSettingsRow = {
@@ -236,38 +176,15 @@ async function fetchShopifyApiData(input: {
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const settings = await getSettingsByShop(session.shop);
-  let engines: EngineOption[] = [];
-
-  if (settings?.apiKey && settings.apiBaseUrl) {
-    try {
-      const { response, body } = await fetchShopifyApiData({
-        apiBaseUrl: settings.apiBaseUrl,
-        apiKey: settings.apiKey,
-      });
-      if (response.ok) {
-        engines = parseEngines(body);
-      }
-    } catch {
-      // Ignore API fetch errors in loader; form can still render.
-    }
-  }
-
-  const selectedEngine = settings?.translationEngine ?? "";
-  if (selectedEngine) {
-    engines = mergeEngines([{ value: selectedEngine, label: selectedEngine }], engines);
-  }
-  engines = mergeEngines(engines, FALLBACK_ENGINES);
-
   const cachedLanguages = parseCachedLanguages(settings?.fetchedLanguages);
 
   return {
     settings: {
       apiBaseUrl: settings?.apiBaseUrl ?? "",
-      translationEngine: selectedEngine,
+      translationEngine: resolveTranslationEngine(settings?.translationEngine),
       enabled: settings?.enabled ?? true,
       hasApiKey: Boolean(settings?.apiKey),
       maskedApiKey: settings?.apiKey ? maskApiKey(settings.apiKey) : "",
-      engines,
       cachedLanguages,
     },
   };
@@ -281,11 +198,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "save-settings") {
     const apiKeyInput = String(formData.get("apiKey") ?? "").trim();
     const apiBaseUrl = normalizeBaseUrl(String(formData.get("apiBaseUrl") ?? ""));
-    const translationEngine = String(formData.get("translationEngine") ?? "").trim();
     const enabled = String(formData.get("enabled") ?? "on") === "on";
 
     const existing = await getSettingsByShop(session.shop);
     const apiKey = apiKeyInput || existing?.apiKey || "";
+    const translationEngine = resolveTranslationEngine(
+      String(formData.get("translationEngine") ?? "") || existing?.translationEngine,
+    );
 
     if (!apiKey || !apiBaseUrl) {
       await insertTranslationLog({
@@ -328,7 +247,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         enabled,
         hasApiKey: true,
         maskedApiKey: maskApiKey(apiKey),
-        engines: [],
         cachedLanguages: parseCachedLanguages(existing?.fetchedLanguages),
       },
     } satisfies ActionData;
@@ -338,11 +256,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const settings = await getSettingsByShop(session.shop);
     const apiKeyInput = String(formData.get("apiKey") ?? "").trim();
     const apiBaseUrlInput = normalizeBaseUrl(String(formData.get("apiBaseUrl") ?? ""));
-    const translationEngineInput = String(formData.get("translationEngine") ?? "").trim();
-
     const apiKey = apiKeyInput || settings?.apiKey || "";
     const apiBaseUrl = apiBaseUrlInput || settings?.apiBaseUrl || "";
-    const selectedEngine = translationEngineInput || settings?.translationEngine || "";
+    const selectedEngine = resolveTranslationEngine(
+      String(formData.get("translationEngine") ?? "") || settings?.translationEngine,
+    );
 
     if (!apiKey || !apiBaseUrl) {
       await insertTranslationLog({
@@ -502,29 +420,17 @@ export default function Index() {
               defaultValue={settings?.apiBaseUrl}
               required
             />
-            <label style={{ display: "grid", gap: "0.35rem", maxWidth: "420px" }}>
-              <span>Translation Engine</span>
-              <s-stack direction="inline" gap="base" alignItems="end">
-                <select
-                  name="translationEngine"
-                  defaultValue={settings?.translationEngine || ""}
-                  style={{ width: "220px", padding: "8px" }}
-                >
-                  <option value="">Select engine</option>
-                  {settings.engines.map((engine) => (
-                    <option key={engine.value} value={engine.value}>
-                      {engine.label}
-                    </option>
-                  ))}
-                </select>
-                <s-button
-                  onClick={() => submitWithIntent("fetch-languages")}
-                  {...(isSubmitting ? { loading: true } : {})}
-                >
-                  Fetch languages
-                </s-button>
-              </s-stack>
-            </label>
+            <input
+              type="hidden"
+              name="translationEngine"
+              value={settings.translationEngine}
+            />
+            <s-button
+              onClick={() => submitWithIntent("fetch-languages")}
+              {...(isSubmitting ? { loading: true } : {})}
+            >
+              Fetch languages
+            </s-button>
             <s-checkbox
               label="Translator enabled"
               name="enabled"
