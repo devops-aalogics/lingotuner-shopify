@@ -13,6 +13,11 @@ export default function App() {
         />
         <Meta />
         <Links />
+        <style
+          dangerouslySetInnerHTML={{
+            __html: `html,body{margin:0;padding:0;min-height:100%;}`,
+          }}
+        />
       </head>
       <body>
         <Outlet />
