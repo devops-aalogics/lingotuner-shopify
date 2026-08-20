@@ -41,6 +41,7 @@ model TranslatorSettings {
   apiBaseUrl        String
   translationEngine String   @default("Google")
   fetchedLanguages  String?
+  localeMappings    String?
   enabled           Boolean  @default(true)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt

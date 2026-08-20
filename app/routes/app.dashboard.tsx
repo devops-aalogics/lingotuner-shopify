@@ -4,6 +4,12 @@ import { useFetcher, useLoaderData } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import {
+  parseLocaleMappings,
+  resolveShopifyLocaleForApiLanguage,
+  resolveShopifyLocaleForApiLanguages,
+  type LocaleMappings,
+} from "../lib/locale-mappings";
 import { insertTranslationLog, resolveTranslationEngine } from "../lib/translation-log.server";
 
 type LanguageOption = { code: string; name: string };
@@ -98,6 +104,14 @@ async function getCachedLanguagesByShop(shop: string): Promise<LanguageOption[]>
     select: { fetchedLanguages: true },
   });
   return parseCachedLanguages(row?.fetchedLanguages);
+}
+
+async function getLocaleMappingsByShop(shop: string): Promise<LocaleMappings> {
+  const row = await prisma.translatorSettings.findUnique({
+    where: { shop },
+    select: { localeMappings: true },
+  });
+  return parseLocaleMappings(row?.localeMappings);
 }
 
 async function getApiSettingsByShop(shop: string): Promise<TranslatorApiSettingsRow | null> {
@@ -423,7 +437,7 @@ async function fetchRemoteRequestsFromApi(settings: TranslatorApiSettingsRow) {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  const [productResult, categoryResult, metafieldDefinitionsResult, requestsResult, cachedLanguagesResult, attributeIndexResult] = await Promise.allSettled([
+  const [productResult, categoryResult, metafieldDefinitionsResult, requestsResult, cachedLanguagesResult, attributeIndexResult, localeMappingsResult] = await Promise.allSettled([
     admin.graphql(
       `#graphql
       query DashboardProducts {
@@ -478,6 +492,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getLocalRequestsByShop(session.shop),
     getCachedLanguagesByShop(session.shop),
     getLatestAttributeIndexByShop(session.shop),
+    getLocaleMappingsByShop(session.shop),
   ]);
 
   if (
@@ -509,6 +524,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     cachedLanguagesResult.status === "fulfilled" ? cachedLanguagesResult.value : [];
   const attributeIndex =
     attributeIndexResult.status === "fulfilled" ? attributeIndexResult.value : null;
+  const localeMappings =
+    localeMappingsResult.status === "fulfilled" ? localeMappingsResult.value : {};
 
   const productJson = (
     productResult.status === "fulfilled"
@@ -648,6 +665,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     products,
     categories,
     apiLanguages: cachedLanguages,
+    localeMappings,
     storeLocales,
     localeAccessLimited,
     requests,
@@ -918,8 +936,28 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!requestUid || !settings?.enabled) {
       return { ok: false, intent, message: "Missing request ID or settings.", requests: await getLocalRequestsByShop(session.shop) } satisfies ActionData;
     }
-    if (!selectedShopifyLocale) {
-      return { ok: false, intent, message: "Please select Shopify language first.", requests: await getLocalRequestsByShop(session.shop) } satisfies ActionData;
+
+    const requestRow = await getLocalRequestByUid(session.shop, requestUid);
+    const localeMappings = await getLocaleMappingsByShop(session.shop);
+    const mappedFromRequestLanguages = resolveShopifyLocaleForApiLanguages(
+      localeMappings,
+      (requestRow?.languages ?? "")
+        .split(",")
+        .map((code) => code.trim())
+        .filter(Boolean),
+    );
+    const translationLocale =
+      selectedShopifyLocale ||
+      requestRow?.storeLocale ||
+      mappedFromRequestLanguages ||
+      "";
+    if (!translationLocale) {
+      return {
+        ok: false,
+        intent,
+        message: "No Shopify locale mapping found. Configure mappings on Settings page first.",
+        requests: await getLocalRequestsByShop(session.shop),
+      } satisfies ActionData;
     }
 
     const endpoint = joinApiUrl(
@@ -957,7 +995,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       } satisfies ActionData;
     }
 
-    const requestRow = await getLocalRequestByUid(session.shop, requestUid);
     if (!requestRow?.itemId) {
       await insertTranslationLog({
         shop: session.shop,
@@ -974,7 +1011,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         requests: await getLocalRequestsByShop(session.shop),
       } satisfies ActionData;
     }
-    const blocks = parseTranslatedBlocks(parsedPayload, selectedShopifyLocale || undefined);
+    const blocks = parseTranslatedBlocks(parsedPayload, translationLocale || undefined);
     if (!blocks.length) {
       await insertTranslationLog({
         shop: session.shop,
@@ -990,17 +1027,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         ok: false,
         intent,
         message: "No translated content found in API response.",
-        requests: await getLocalRequestsByShop(session.shop),
-      } satisfies ActionData;
-    }
-
-    const translationLocale =
-      selectedShopifyLocale || requestRow.storeLocale || (requestRow.languages ?? "").split(",")[0]?.trim() || "";
-    if (!translationLocale) {
-      return {
-        ok: false,
-        intent,
-        message: "Locale is missing for this translation request.",
         requests: await getLocalRequestsByShop(session.shop),
       } satisfies ActionData;
     }
@@ -1741,9 +1767,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   let selectedItems = formData.getAll("selectedItems").map(String);
   const selectedContentType = String(formData.get("selectedContentType") ?? "product").trim().toLowerCase();
   const targetLanguages = formData.getAll("targetLanguages").map(String);
-  const selectedStoreLocale = String(formData.get("selectedStoreLocale") ?? "").trim();
   const selectedFields = formData.getAll("selectedFields").map(String);
   const isAttributeMode = selectedContentType === "attribute" || selectedContentType === "attribute_value";
+  const localeMappings = await getLocaleMappingsByShop(session.shop);
+  const unmappedLanguages = targetLanguages.filter(
+    (code) => !resolveShopifyLocaleForApiLanguage(localeMappings, code),
+  );
+  const selectedStoreLocale = resolveShopifyLocaleForApiLanguages(localeMappings, targetLanguages) || "";
 
   if (!selectedItems.length && !isAttributeMode) {
     return { ok: false, intent, message: "Select at least one item before starting translation." } satisfies ActionData;
@@ -1754,8 +1784,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (!selectedFields.length) {
     return { ok: false, intent, message: "Select at least one content field." } satisfies ActionData;
   }
+  if (unmappedLanguages.length) {
+    return {
+      ok: false,
+      intent,
+      message: `Map these API languages on Settings first: ${unmappedLanguages.join(", ")}`,
+    } satisfies ActionData;
+  }
   if (!selectedStoreLocale) {
-    return { ok: false, intent, message: "Please select Shopify language first." } satisfies ActionData;
+    return {
+      ok: false,
+      intent,
+      message: "No Shopify locale mapping found. Configure mappings on Settings page first.",
+    } satisfies ActionData;
   }
   if (isAttributeMode && !selectedItems.length) {
     const attributeProductsResponse = await admin.graphql(
@@ -2082,6 +2123,7 @@ export default function DashboardRoute() {
     products,
     categories,
     apiLanguages,
+    localeMappings,
     storeLocales,
     localeAccessLimited,
     requests: initialRequests,
@@ -2099,9 +2141,6 @@ export default function DashboardRoute() {
   >("product");
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
   const [selectedLanguages, setSelectedLanguages] = useState<string[]>([]);
-  const [selectedStoreLocale, setSelectedStoreLocale] = useState("");
-  const [pendingStoreLocale, setPendingStoreLocale] = useState("");
-  const [isLocaleModalOpen, setIsLocaleModalOpen] = useState(false);
   const [selectedFields, setSelectedFields] = useState<string[]>([
     "name",
     "description",
@@ -2114,7 +2153,22 @@ export default function DashboardRoute() {
   const requestsPerPage = 10;
 
   const isSubmittingTranslation = ["loading", "submitting"].includes(translateFetcher.state);
-  const selectableStoreLocales = useMemo(() => storeLocales, [storeLocales]);
+  const selectedStoreLocale = useMemo(
+    () => resolveShopifyLocaleForApiLanguages(localeMappings, selectedLanguages) || "",
+    [localeMappings, selectedLanguages],
+  );
+  const unmappedSelectedLanguages = useMemo(
+    () =>
+      selectedLanguages.filter((code) => !resolveShopifyLocaleForApiLanguage(localeMappings, code)),
+    [localeMappings, selectedLanguages],
+  );
+  const mappedStoreLocaleLabel = useMemo(() => {
+    if (!selectedStoreLocale) return "";
+    const locale = storeLocales.find((row) => row.locale === selectedStoreLocale);
+    return locale
+      ? `${locale.name} (${locale.locale})`
+      : selectedStoreLocale;
+  }, [selectedStoreLocale, storeLocales]);
 
   const filteredProducts = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
@@ -2209,26 +2263,6 @@ export default function DashboardRoute() {
   }, [requestFetcher.data, shopify]);
 
   useEffect(() => {
-    if (!selectableStoreLocales.length) {
-      setSelectedStoreLocale("");
-      setPendingStoreLocale("");
-      setIsLocaleModalOpen(false);
-      return;
-    }
-    if (!selectableStoreLocales.some((locale) => locale.locale === selectedStoreLocale)) {
-      setSelectedStoreLocale("");
-      setPendingStoreLocale("");
-      setIsLocaleModalOpen(true);
-    }
-  }, [selectableStoreLocales, selectedStoreLocale]);
-
-  useEffect(() => {
-    if (selectableStoreLocales.length && !selectedStoreLocale) {
-      setIsLocaleModalOpen(true);
-    }
-  }, [selectableStoreLocales, selectedStoreLocale]);
-
-  useEffect(() => {
     setRequestsPage(1);
   }, [statusFilter]);
 
@@ -2287,8 +2321,8 @@ export default function DashboardRoute() {
               boxSizing: "border-box",
               gridTemplateColumns:
                 selectedContentType === "attribute" || selectedContentType === "attribute_value"
-                  ? "minmax(180px, 0.8fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(380px, 2.2fr)"
-                  : "minmax(180px, 0.8fr) minmax(250px, 1.4fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(180px, 1fr)",
+                  ? "minmax(180px, 0.8fr) minmax(180px, 1fr) minmax(380px, 2.2fr)"
+                  : "minmax(180px, 0.8fr) minmax(250px, 1.4fr) minmax(180px, 1fr) minmax(180px, 1fr)",
               gap: "var(--p-space-400, 16px)",
               alignItems: "start",
             }}
@@ -2398,63 +2432,31 @@ export default function DashboardRoute() {
                     ))}
                   </select>
                   <p style={{ marginTop: "8px", color: "#6b7280", fontSize: "13px" }}>
-                    These languages are sent to your translation API.
+                    These languages are sent to your translation API. Shopify store locale is applied
+                    automatically from Settings mappings
+                    {mappedStoreLocaleLabel ? `: ${mappedStoreLocaleLabel}` : ""}.
                   </p>
+                  {unmappedSelectedLanguages.length ? (
+                    <p style={{ marginTop: "6px", color: "#b45309", fontSize: "13px" }}>
+                      Unmapped languages: {unmappedSelectedLanguages.join(", ")}. Configure them on
+                      Settings.
+                    </p>
+                  ) : null}
+                  {localeAccessLimited ? (
+                    <p style={{ marginTop: "6px", color: "#b45309", fontSize: "13px" }}>
+                      Store locales scope may be missing. Add read_locales and reinstall if needed.
+                    </p>
+                  ) : null}
                 </>
               ) : (
                 <s-paragraph>No API languages found. Fetch languages on Settings page first.</s-paragraph>
               )}
             </div>
 
-            <div>
-              <h4 style={{ margin: "0 0 10px" }}>Shopify Store</h4>
-              {selectableStoreLocales.length ? (
-                <>
-                  <input
-                    type="text"
-                    readOnly
-                    value={
-                      selectedStoreLocale
-                        ? `${selectableStoreLocales.find((locale) => locale.locale === selectedStoreLocale)?.name ?? selectedStoreLocale} (${selectedStoreLocale})`
-                        : "No language selected yet"
-                    }
-                    style={{
-                      width: "100%",
-                      minHeight: "42px",
-                      padding: "6px",
-                      boxSizing: "border-box",
-                      background: "#f3f4f6",
-                      color: "#6b7280",
-                      border: "1px solid #d1d5db",
-                      borderRadius: "6px",
-                      cursor: "not-allowed",
-                    }}
-                  />
-                  <div style={{ marginTop: "8px", display: "flex", gap: "8px", alignItems: "center" }}>
-                    <s-button type="button" variant="secondary" onClick={() => {
-                      setPendingStoreLocale(selectedStoreLocale);
-                      setIsLocaleModalOpen(true);
-                    }}>
-                      {selectedStoreLocale ? "Edit language" : "Select language"}
-                    </s-button>
-                  </div>
-                  <p style={{ marginTop: "8px", color: "#6b7280", fontSize: "13px" }}>
-                    When you click Fetch content, translation is applied only to this Shopify locale.
-                  </p>
-                </>
-              ) : (
-                <s-paragraph>
-                  {localeAccessLimited
-                    ? "Store locales scope is missing. Add read_locales scope and reinstall app."
-                    : "No published secondary store language found. Add/publish language in Shopify settings first."}
-                </s-paragraph>
-              )}
-            </div>
-
             <div
               style={
                 selectedContentType === "attribute" || selectedContentType === "attribute_value"
-                  ? { gridColumn: "4 / span 1" }
+                  ? { gridColumn: "3 / span 1" }
                   : undefined
               }
             >
@@ -2486,7 +2488,12 @@ export default function DashboardRoute() {
             <s-button
               type="submit"
               variant="primary"
-              disabled={!selectedLanguages.length || !selectedFields.length || !selectedStoreLocale}
+              disabled={
+                !selectedLanguages.length ||
+                !selectedFields.length ||
+                !selectedStoreLocale ||
+                Boolean(unmappedSelectedLanguages.length)
+              }
               {...(isSubmittingTranslation ? { loading: true } : {})}
             >
               Start Translation
@@ -2564,13 +2571,21 @@ export default function DashboardRoute() {
                         {completed && !requestRow.isTranslated ? (
                           <s-button
                             variant="secondary"
-                            disabled={!selectedStoreLocale}
                             onClick={() =>
                               requestFetcher.submit(
                                 {
                                   intent: "fetch_content",
                                   requestUid: requestRow.requestUid,
-                                  shopifyLocale: selectedStoreLocale,
+                                  shopifyLocale:
+                                    requestRow.storeLocale ||
+                                    resolveShopifyLocaleForApiLanguages(
+                                      localeMappings,
+                                      (requestRow.languages ?? "")
+                                        .split(",")
+                                        .map((code) => code.trim())
+                                        .filter(Boolean),
+                                    ) ||
+                                    "",
                                 },
                                 { method: "POST" },
                               )
@@ -2646,70 +2661,6 @@ export default function DashboardRoute() {
           ) : null}
         </s-section>
       </div>
-
-      {isLocaleModalOpen ? (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(17, 24, 39, 0.45)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 2000,
-            padding: "16px",
-          }}
-        >
-          <div
-            style={{
-              width: "100%",
-              maxWidth: "460px",
-              background: "#fff",
-              borderRadius: "12px",
-              padding: "16px",
-              boxSizing: "border-box",
-            }}
-          >
-            <h3 style={{ margin: "0 0 8px" }}>Select Shopify language first</h3>
-            <p style={{ margin: "0 0 12px", color: "#4b5563", fontSize: "14px" }}>
-              Choose the store language you want to work on. You can change it later using Edit language.
-            </p>
-            <select
-              value={pendingStoreLocale}
-              onChange={(event) => setPendingStoreLocale(event.target.value)}
-              style={{ width: "100%", minHeight: "42px", padding: "6px", marginBottom: "12px" }}
-            >
-              <option value="" disabled>
-                Select language
-              </option>
-              {selectableStoreLocales.map((locale) => (
-                <option key={locale.locale} value={locale.locale}>
-                  {locale.name} ({locale.locale}){locale.primary ? " - Default" : ""}
-                </option>
-              ))}
-            </select>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
-              {selectedStoreLocale ? (
-                <s-button type="button" variant="secondary" onClick={() => setIsLocaleModalOpen(false)}>
-                  Cancel
-                </s-button>
-              ) : null}
-              <s-button
-                type="button"
-                variant="primary"
-                disabled={!pendingStoreLocale}
-                onClick={() => {
-                  if (!pendingStoreLocale) return;
-                  setSelectedStoreLocale(pendingStoreLocale);
-                  setIsLocaleModalOpen(false);
-                }}
-              >
-                Save language
-              </s-button>
-            </div>
-          </div>
-        </div>
-      ) : null}
     </s-page>
   );
 }

@@ -9,6 +9,11 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import prisma from "../db.server";
+import {
+  parseLocaleMappings,
+  serializeLocaleMappings,
+  type LocaleMappings,
+} from "../lib/locale-mappings";
 import { insertTranslationLog, resolveTranslationEngine } from "../lib/translation-log.server";
 
 type LanguageOption = {
@@ -16,9 +21,16 @@ type LanguageOption = {
   name: string;
 };
 
+type StoreLocaleRow = {
+  locale: string;
+  name: string;
+  primary: boolean;
+  published: boolean;
+};
+
 type ActionData = {
   ok: boolean;
-  intent: "save-settings" | "fetch-languages";
+  intent: "save-settings" | "fetch-languages" | "save-locale-mappings";
   message?: string;
   error?: string;
   settings?: {
@@ -28,8 +40,10 @@ type ActionData = {
     hasApiKey: boolean;
     maskedApiKey: string;
     cachedLanguages: LanguageOption[];
+    localeMappings: LocaleMappings;
   };
   languages?: LanguageOption[];
+  localeMappings?: LocaleMappings;
 };
 
 function maskApiKey(key: string) {
@@ -89,6 +103,7 @@ type TranslatorSettingsRow = {
   apiBaseUrl: string;
   translationEngine: string;
   fetchedLanguages: string | null;
+  localeMappings: string | null;
   enabled: boolean;
 };
 
@@ -100,10 +115,33 @@ async function getSettingsByShop(shop: string): Promise<TranslatorSettingsRow | 
       apiBaseUrl: true,
       translationEngine: true,
       fetchedLanguages: true,
+      localeMappings: true,
       enabled: true,
     },
   });
   return row ?? null;
+}
+
+async function saveLocaleMappingsByShop(shop: string, mappings: LocaleMappings) {
+  await prisma.translatorSettings.updateMany({
+    where: { shop },
+    data: {
+      localeMappings: serializeLocaleMappings(mappings),
+    },
+  });
+}
+
+function parseLocaleMappingsFromForm(formData: FormData): LocaleMappings {
+  const mappings: LocaleMappings = {};
+  for (const [key, value] of formData.entries()) {
+    if (!String(key).startsWith("localeMap[")) continue;
+    const match = String(key).match(/^localeMap\[(.+)\]$/);
+    if (!match?.[1]) continue;
+    const shopifyLocale = match[1].trim();
+    const apiCode = String(value ?? "").trim();
+    if (shopifyLocale && apiCode) mappings[shopifyLocale] = apiCode;
+  }
+  return mappings;
 }
 
 async function upsertSettingsByShop(input: {
@@ -173,9 +211,32 @@ async function fetchShopifyApiData(input: {
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const settings = await getSettingsByShop(session.shop);
   const cachedLanguages = parseCachedLanguages(settings?.fetchedLanguages);
+  const localeMappings = parseLocaleMappings(settings?.localeMappings);
+
+  let storeLocales: StoreLocaleRow[] = [];
+  let localeAccessLimited = false;
+  try {
+    const localesResponse = await admin.graphql(
+      `#graphql
+      query SettingsShopLocales {
+        shopLocales {
+          locale
+          name
+          primary
+          published
+        }
+      }`,
+    );
+    const localesJson = (await localesResponse.json()) as {
+      data?: { shopLocales?: StoreLocaleRow[] };
+    };
+    storeLocales = (localesJson.data?.shopLocales ?? []).filter((locale) => locale.published);
+  } catch {
+    localeAccessLimited = true;
+  }
 
   return {
     settings: {
@@ -185,7 +246,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       hasApiKey: Boolean(settings?.apiKey),
       maskedApiKey: settings?.apiKey ? maskApiKey(settings.apiKey) : "",
       cachedLanguages,
+      localeMappings,
     },
+    storeLocales,
+    localeAccessLimited,
   };
 };
 
@@ -227,13 +291,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       translationEngine,
       enabled,
     });
+    const localeMappings = parseLocaleMappingsFromForm(formData);
+    if (Object.keys(localeMappings).length || formData.has("localeMappingsPresent")) {
+      await saveLocaleMappingsByShop(session.shop, localeMappings);
+    }
     await insertTranslationLog({
       shop: session.shop,
       level: "success",
       contentType: "configuration",
       action: "save_settings",
       message: "Translator settings saved.",
-      metadata: { translationEngine, enabled, apiBaseUrl },
+      metadata: { translationEngine, enabled, apiBaseUrl, localeMappings },
     });
 
     return {
@@ -247,6 +315,46 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         hasApiKey: true,
         maskedApiKey: maskApiKey(apiKey),
         cachedLanguages: parseCachedLanguages(existing?.fetchedLanguages),
+        localeMappings,
+      },
+      localeMappings,
+    } satisfies ActionData;
+  }
+
+  if (intent === "save-locale-mappings") {
+    const existing = await getSettingsByShop(session.shop);
+    if (!existing) {
+      return {
+        ok: false,
+        intent: "save-locale-mappings",
+        error: "Save API settings first, then configure locale mappings.",
+      } satisfies ActionData;
+    }
+
+    const localeMappings = parseLocaleMappingsFromForm(formData);
+    await saveLocaleMappingsByShop(session.shop, localeMappings);
+    await insertTranslationLog({
+      shop: session.shop,
+      level: "success",
+      contentType: "configuration",
+      action: "save_locale_mappings",
+      message: `Saved ${Object.keys(localeMappings).length} locale mapping(s).`,
+      metadata: { localeMappings },
+    });
+
+    return {
+      ok: true,
+      intent: "save-locale-mappings",
+      message: "Shopify store locale mappings saved.",
+      localeMappings,
+      settings: {
+        apiBaseUrl: existing.apiBaseUrl,
+        translationEngine: resolveTranslationEngine(existing.translationEngine),
+        enabled: existing.enabled,
+        hasApiKey: Boolean(existing.apiKey),
+        maskedApiKey: existing.apiKey ? maskApiKey(existing.apiKey) : "",
+        cachedLanguages: parseCachedLanguages(existing.fetchedLanguages),
+        localeMappings,
       },
     } satisfies ActionData;
   }
@@ -363,9 +471,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Index() {
-  const { settings } = useLoaderData<typeof loader>();
+  const { settings, storeLocales, localeAccessLimited } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<ActionData>();
   const [languages, setLanguages] = useState<LanguageOption[]>(settings.cachedLanguages ?? []);
+  const [localeMappings, setLocaleMappings] = useState<LocaleMappings>(settings.localeMappings ?? {});
   const formRef = useRef<HTMLFormElement | null>(null);
 
   const shopify = useAppBridge();
@@ -378,6 +487,10 @@ export default function Index() {
   }, [settings.cachedLanguages]);
 
   useEffect(() => {
+    setLocaleMappings(settings.localeMappings ?? {});
+  }, [settings.localeMappings]);
+
+  useEffect(() => {
     if (fetcher.data?.message) {
       shopify.toast.show(fetcher.data.message);
     }
@@ -387,82 +500,222 @@ export default function Index() {
     if (fetcher.data?.intent === "fetch-languages" && fetcher.data?.languages) {
       setLanguages(fetcher.data.languages);
     }
+    if (fetcher.data?.localeMappings) {
+      setLocaleMappings(fetcher.data.localeMappings);
+    }
   }, [
     fetcher.data?.error,
     fetcher.data?.intent,
     fetcher.data?.languages,
+    fetcher.data?.localeMappings,
     fetcher.data?.message,
     shopify,
   ]);
 
-  const submitWithIntent = (intent: "save-settings" | "fetch-languages") => {
+  const submitWithIntent = (intent: "save-settings" | "fetch-languages" | "save-locale-mappings") => {
     if (!formRef.current) return;
     const formData = new FormData(formRef.current);
     formData.set("intent", intent);
     fetcher.submit(formData, { method: "POST" });
   };
 
+  const setMappingForLocale = (shopifyLocale: string, apiCode: string) => {
+    setLocaleMappings((prev) => {
+      const next = { ...prev };
+      if (!apiCode) {
+        delete next[shopifyLocale];
+      } else {
+        next[shopifyLocale] = apiCode;
+      }
+      return next;
+    });
+  };
+
   return (
     <s-page heading="Lingotuner Translator Settings" inlineSize="large">
-      <s-section heading="API Setup">
-        <fetcher.Form method="POST" ref={formRef}>
-          <s-stack direction="block" gap="base">
-            <s-text-field
-              label="API Key"
-              name="apiKey"
-              placeholder={settings?.maskedApiKey || "Enter API key"}
-              required={!settings?.hasApiKey}
-            />
-            <s-text-field
-              label="API Base URL"
-              name="apiBaseUrl"
-              defaultValue={settings?.apiBaseUrl}
-              required
-            />
-            <input
-              type="hidden"
-              name="translationEngine"
-              value={settings.translationEngine}
-            />
-            <s-button
-              onClick={() => submitWithIntent("fetch-languages")}
-              {...(isSubmitting ? { loading: true } : {})}
-            >
-              Fetch languages
-            </s-button>
-            <s-checkbox
-              label="Translator enabled"
-              name="enabled"
-              checked={settings?.enabled ?? true}
-            />
-            <s-button
-              onClick={() => submitWithIntent("save-settings")}
-              {...(isSubmitting ? { loading: true } : {})}
-            >
-              Save settings
-            </s-button>
-          </s-stack>
-        </fetcher.Form>
-      </s-section>
+      <fetcher.Form method="POST" ref={formRef}>
+        <input type="hidden" name="localeMappingsPresent" value="1" />
+        {Object.entries(localeMappings).map(([shopifyLocale, apiCode]) => (
+          <input
+            key={`map-hidden-${shopifyLocale}`}
+            type="hidden"
+            name={`localeMap[${shopifyLocale}]`}
+            value={apiCode}
+          />
+        ))}
 
-      <s-section heading="Supported Languages">
-        <s-paragraph>
-          Save settings first, then click <s-text>Fetch languages</s-text> in the page header.
-        </s-paragraph>
-        {fetchedLanguages.length > 0 ? (
-          <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
-            <s-unordered-list>
-              {fetchedLanguages.map((language) => (
-                <s-list-item key={language.code}>
-                  {language.name} ({language.code})
-                </s-list-item>
-              ))}
-            </s-unordered-list>
-          </s-box>
-        ) : (
-          <s-paragraph>No languages loaded yet.</s-paragraph>
-        )}
-      </s-section>
+        <div style={{ marginBottom: "16px" }}>
+          <s-section heading="API Setup">
+            <s-stack direction="block" gap="base">
+              <s-text-field
+                label="API Key"
+                name="apiKey"
+                placeholder={settings?.maskedApiKey || "Enter API key"}
+                required={!settings?.hasApiKey}
+              />
+              <s-text-field
+                label="API Base URL"
+                name="apiBaseUrl"
+                defaultValue={settings?.apiBaseUrl}
+                required
+              />
+              <input
+                type="hidden"
+                name="translationEngine"
+                value={settings.translationEngine}
+              />
+              <s-button
+                onClick={() => submitWithIntent("fetch-languages")}
+                {...(isSubmitting ? { loading: true } : {})}
+              >
+                Fetch languages
+              </s-button>
+              <s-checkbox
+                label="Translator enabled"
+                name="enabled"
+                checked={settings?.enabled ?? true}
+              />
+              <s-button
+                onClick={() => submitWithIntent("save-settings")}
+                {...(isSubmitting ? { loading: true } : {})}
+              >
+                Save settings
+              </s-button>
+            </s-stack>
+          </s-section>
+        </div>
+
+        <div style={{ marginBottom: "16px" }}>
+          <s-section heading="Shopify Store Locale Mapping">
+          <s-stack direction="block" gap="small">
+            <s-paragraph>
+              Map each Shopify store language to an API language once. Home page uses this mapping
+              automatically.
+            </s-paragraph>
+
+            {localeAccessLimited ? (
+              <s-paragraph>
+                Store locales scope is missing. Add <s-text>read_locales</s-text> scope and reinstall
+                the app.
+              </s-paragraph>
+            ) : null}
+
+            {!localeAccessLimited && !storeLocales.length ? (
+              <s-paragraph>
+                No published store languages found. Add/publish languages in Shopify settings first.
+              </s-paragraph>
+            ) : null}
+
+            {!localeAccessLimited && storeLocales.length && !fetchedLanguages.length ? (
+              <s-paragraph>Fetch API languages first, then set mappings below.</s-paragraph>
+            ) : null}
+
+            {!localeAccessLimited && storeLocales.length && fetchedLanguages.length ? (
+              <div style={{ overflowX: "auto", maxWidth: "860px" }}>
+                <table
+                  style={{
+                    width: "100%",
+                    borderCollapse: "collapse",
+                    minWidth: "480px",
+                    tableLayout: "fixed",
+                  }}
+                >
+                  <thead>
+                    <tr>
+                      <th
+                        style={{
+                          textAlign: "left",
+                          padding: "6px 8px",
+                          borderBottom: "1px solid #e5e7eb",
+                          width: "45%",
+                        }}
+                      >
+                        Shopify Store
+                      </th>
+                      <th
+                        style={{
+                          textAlign: "left",
+                          padding: "6px 8px",
+                          borderBottom: "1px solid #e5e7eb",
+                          width: "55%",
+                        }}
+                      >
+                        Mapped API Language
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {storeLocales.map((locale) => (
+                      <tr key={locale.locale}>
+                        <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6", verticalAlign: "middle" }}>
+                          {locale.name} ({locale.locale})
+                          {locale.primary ? " — Default" : ""}
+                        </td>
+                        <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6", verticalAlign: "middle" }}>
+                          <select
+                            value={localeMappings[locale.locale] ?? ""}
+                            onChange={(event) => setMappingForLocale(locale.locale, event.target.value)}
+                            style={{
+                              width: "100%",
+                              minHeight: "34px",
+                              padding: "4px 8px",
+                              boxSizing: "border-box",
+                            }}
+                          >
+                            <option value="">Not mapped</option>
+                            {fetchedLanguages.map((language) => (
+                              <option key={`${locale.locale}-${language.code}`} value={language.code}>
+                                {language.name} ({language.code})
+                              </option>
+                            ))}
+                          </select>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div style={{ marginTop: "10px" }}>
+                  <s-button
+                    onClick={() => submitWithIntent("save-locale-mappings")}
+                    {...(isSubmitting ? { loading: true } : {})}
+                  >
+                    Save locale mappings
+                  </s-button>
+                </div>
+              </div>
+            ) : null}
+          </s-stack>
+          </s-section>
+        </div>
+
+        <s-section heading="Supported Languages">
+          <s-stack direction="block" gap="small">
+            <s-paragraph>
+              Save settings first, then click <s-text>Fetch languages</s-text>.
+            </s-paragraph>
+            {fetchedLanguages.length > 0 ? (
+              <s-box padding="base" borderWidth="base" borderRadius="base" background="subdued">
+                <ul
+                  style={{
+                    columnCount: 2,
+                    columnGap: "24px",
+                    margin: 0,
+                    paddingLeft: "20px",
+                  }}
+                >
+                  {fetchedLanguages.map((language) => (
+                    <li key={language.code} style={{ breakInside: "avoid", marginBottom: "4px" }}>
+                      {language.name} ({language.code})
+                    </li>
+                  ))}
+                </ul>
+              </s-box>
+            ) : (
+              <s-paragraph>No languages loaded yet.</s-paragraph>
+            )}
+          </s-stack>
+        </s-section>
+      </fetcher.Form>
     </s-page>
   );
 }
