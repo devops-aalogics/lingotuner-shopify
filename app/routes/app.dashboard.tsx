@@ -13,7 +13,14 @@ import {
 import { insertTranslationLog, resolveTranslationEngine } from "../lib/translation-log.server";
 
 type LanguageOption = { code: string; name: string };
-type ProductRow = { id: string; numericId: string; title: string; handle: string; options: string[] };
+type ProductRow = {
+  id: string;
+  numericId: string;
+  title: string;
+  handle: string;
+  options: string[];
+  metafieldKeys: string[];
+};
 type CategoryRow = { id: string; numericId: string; title: string; handle: string; description: string; seoTitle: string; seoDescription: string };
 type ProductOptionValueRow = { id: string; name: string };
 type ProductOptionRow = { id: string; name: string; optionValues?: ProductOptionValueRow[] };
@@ -480,6 +487,15 @@ async function fetchAllDashboardProducts(admin: AdminGraphqlClient): Promise<Pro
               title
               handle
               options { name }
+              metafields(first: 50) {
+                edges {
+                  node {
+                    namespace
+                    key
+                    type
+                  }
+                }
+              }
             }
           }
         }
@@ -491,7 +507,21 @@ async function fetchAllDashboardProducts(admin: AdminGraphqlClient): Promise<Pro
         products?: {
           pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
           edges?: Array<{
-            node: { id: string; title: string; handle: string; options?: Array<{ name: string }> };
+            node: {
+              id: string;
+              title: string;
+              handle: string;
+              options?: Array<{ name: string }>;
+              metafields?: {
+                edges?: Array<{
+                  node?: {
+                    namespace?: string | null;
+                    key?: string | null;
+                    type?: string | null;
+                  } | null;
+                }>;
+              } | null;
+            };
           }>;
         };
       };
@@ -499,12 +529,28 @@ async function fetchAllDashboardProducts(admin: AdminGraphqlClient): Promise<Pro
     const page = json.data?.products;
     const edges = page?.edges ?? [];
     for (const edge of edges) {
+      const metafieldKeys = Array.from(
+        new Set(
+          (edge.node.metafields?.edges ?? [])
+            .map((metafieldEdge) => metafieldEdge?.node)
+            .filter(
+              (node): node is { namespace: string; key: string; type: string } =>
+                Boolean(
+                  node?.namespace &&
+                    node.key &&
+                    TEXT_METAFIELD_TYPES.has(String(node.type ?? "")),
+                ),
+            )
+            .map((node) => metafieldSelectValue(String(node.namespace), String(node.key))),
+        ),
+      );
       products.push({
         id: edge.node.id,
         numericId: edge.node.id.split("/").pop() ?? edge.node.id,
         title: edge.node.title,
         handle: edge.node.handle,
         options: (edge.node.options ?? []).map((option) => option.name),
+        metafieldKeys,
       });
     }
     hasNextPage = Boolean(page?.pageInfo?.hasNextPage);
@@ -2548,8 +2594,19 @@ export default function DashboardRoute() {
   const dynamicAttributes = useMemo(() => {
     const set = new Set<string>();
     selectedProducts.forEach((product) => product.options.forEach((name) => name.trim() && set.add(name.trim())));
-    return Array.from(set);
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [selectedProducts]);
+
+  const selectedProductMetafieldFields = useMemo(() => {
+    if (!selectedProducts.length) return [] as AttributePickerOption[];
+    const allowedKeys = new Set(
+      selectedProducts.flatMap((product) => product.metafieldKeys ?? []),
+    );
+    if (!allowedKeys.size) return [] as AttributePickerOption[];
+    return discoveredAttributeFields.filter(
+      (field) => field.value.startsWith("mf__") && allowedKeys.has(field.value),
+    );
+  }, [discoveredAttributeFields, selectedProducts]);
 
   const discoveredAttributeValueFields = useMemo(
     () =>
@@ -2588,7 +2645,7 @@ export default function DashboardRoute() {
             { value: "sku", label: "SKU" },
             ...(selectedProducts.length
               ? [
-                  ...discoveredAttributeFields.filter((field) => field.value.startsWith("mf__")),
+                  ...selectedProductMetafieldFields,
                   ...dynamicAttributes.map((attr) => ({
                     value: `prod_attr_name_${toFieldKey(attr)}`,
                     label: `${attr} (Attribute Name)`,
@@ -2601,16 +2658,21 @@ export default function DashboardRoute() {
       discoveredAttributeValueFields,
       dynamicAttributes,
       selectedContentType,
+      selectedProductMetafieldFields,
       selectedProducts.length,
     ],
   );
 
   useEffect(() => {
-    if (selectedContentType !== "product" || selectedProducts.length) return;
-    setSelectedFields((prev) =>
-      prev.filter((field) => !field.startsWith("mf__") && !field.startsWith("prod_attr_")),
-    );
-  }, [selectedContentType, selectedProducts.length]);
+    if (selectedContentType !== "product") return;
+    const allowed = new Set(fieldOptions.map((field) => field.value));
+    setSelectedFields((prev) => {
+      const next = prev.filter((field) => allowed.has(field));
+      return next.length === prev.length && next.every((field, index) => field === prev[index])
+        ? prev
+        : next;
+    });
+  }, [fieldOptions, selectedContentType]);
 
   const visibleRequests = useMemo(
     () => requests.filter((r) => statusFilter === "All" || r.status.toLowerCase() === statusFilter.toLowerCase()),
