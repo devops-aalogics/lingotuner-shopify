@@ -226,6 +226,18 @@ function toFieldKey(input: string) {
   return input.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
+const TEXT_METAFIELD_TYPES = new Set([
+  "single_line_text_field",
+  "multi_line_text_field",
+  "rich_text_field",
+  "list.single_line_text_field",
+  "list.multi_line_text_field",
+]);
+
+function metafieldSelectValue(namespace: string, key: string) {
+  return `mf__${toFieldKey(namespace)}__${toFieldKey(key)}`;
+}
+
 function isDefaultNonAttributeOption(input: string) {
   const key = toFieldKey(input);
   return key === "title";
@@ -242,7 +254,9 @@ function attributeFieldLabel(fieldKey: string) {
       .join(" ");
   }
   if (key.startsWith("mf__")) {
-    const [, namespace = "", metafieldKey = ""] = key.split("__");
+    const parts = key.split("__");
+    const namespace = parts[1] ?? "";
+    const metafieldKey = parts.slice(2).join("__");
     return `Metafield ${namespace}.${metafieldKey}`;
   }
   return fieldKey;
@@ -623,7 +637,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     admin.graphql(
       `#graphql
       query DashboardProductMetafieldDefinitions {
-        metafieldDefinitions(first: 100, ownerType: PRODUCT) {
+        metafieldDefinitions(first: 250, ownerType: PRODUCT) {
           edges {
             node {
               name
@@ -700,11 +714,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     };
   };
 
-  const textMetafieldTypes = new Set([
-    "single_line_text_field",
-    "multi_line_text_field",
-    "rich_text_field",
-  ]);
   const discoveredAttributeFields: AttributePickerOption[] = [];
   const seenAttributeValues = new Set<string>();
   const pushAttribute = (value: string, label: string) => {
@@ -732,8 +741,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const key = String(node?.key ?? "").trim();
     const name = String(node?.name ?? "").trim();
     const typeName = String(node?.type?.name ?? "").trim();
-    if (!namespace || !key || !textMetafieldTypes.has(typeName)) return;
-    pushAttribute(`mf__${toFieldKey(namespace)}__${toFieldKey(key)}`, `${name || key} (${namespace}.${key})`);
+    if (!namespace || !key || !TEXT_METAFIELD_TYPES.has(typeName)) return;
+    pushAttribute(
+      metafieldSelectValue(namespace, key),
+      `${name || key} (Metafield ${namespace}.${key})`,
+    );
   });
 
   let localeAccessLimited = false;
@@ -761,10 +773,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     localeAccessLimited = true;
   }
 
-  const attributeFields =
-    attributeIndex?.attributes?.length
-      ? attributeIndex.attributes
-      : discoveredAttributeFields;
+  // Prefer live Shopify discovery, then merge any extra fields from the cached attribute index.
+  if (attributeIndex?.attributes?.length) {
+    attributeIndex.attributes.forEach((entry) => {
+      pushAttribute(entry.value, entry.label);
+    });
+  }
+
+  const attributeFields = discoveredAttributeFields;
 
   return {
     products,
@@ -861,7 +877,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (intent === "sync_attribute_index") {
     const optionNameSet = new Set<string>();
-    const textMetafieldTypes = new Set(["single_line_text_field", "multi_line_text_field", "rich_text_field"]);
     let hasNextPage = true;
     let cursor: string | null = null;
     let scannedProducts = 0;
@@ -958,11 +973,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const key = String(node?.key ?? "").trim();
       const name = String(node?.name ?? "").trim();
       const typeName = String(node?.type?.name ?? "").trim();
-      if (!namespace || !key || !textMetafieldTypes.has(typeName)) return;
-      const value = `mf__${toFieldKey(namespace)}__${toFieldKey(key)}`;
+      if (!namespace || !key || !TEXT_METAFIELD_TYPES.has(typeName)) return;
+      const value = metafieldSelectValue(namespace, key);
       if (seenValues.has(value)) return;
       seenValues.add(value);
-      attributes.push({ value, label: `${name || key} (${namespace}.${key})` });
+      attributes.push({ value, label: `${name || key} (Metafield ${namespace}.${key})` });
     });
 
     const snapshot: AttributeIndexSnapshot = {
@@ -1362,6 +1377,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                   name
                 }
               }
+              metafields(first: 100) {
+                edges {
+                  node {
+                    id
+                    namespace
+                    key
+                    type
+                  }
+                }
+              }
             }
           }
         }
@@ -1373,12 +1398,42 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const productLookupJson = (await productLookupResponse.json()) as {
       data?: {
         products?: {
-          edges?: Array<{ node: { id: string; title: string; options?: ProductOptionRow[] } }>;
+          edges?: Array<{
+            node: {
+              id: string;
+              title: string;
+              options?: ProductOptionRow[];
+              metafields?: {
+                edges?: Array<{
+                  node?: {
+                    id?: string | null;
+                    namespace?: string | null;
+                    key?: string | null;
+                    type?: string | null;
+                  } | null;
+                }>;
+              } | null;
+            };
+          }>;
         };
       };
     };
     const productGid = productLookupJson.data?.products?.edges?.[0]?.node?.id;
     const productOptions = productLookupJson.data?.products?.edges?.[0]?.node?.options ?? [];
+    const productMetafields = (productLookupJson.data?.products?.edges?.[0]?.node?.metafields?.edges ?? [])
+      .map((edge) => edge?.node)
+      .filter(
+        (
+          node,
+        ): node is { id: string; namespace: string; key: string; type: string } =>
+          Boolean(node?.id && node.namespace && node.key),
+      )
+      .map((node) => ({
+        id: String(node.id),
+        namespace: String(node.namespace),
+        key: String(node.key),
+        type: String(node.type ?? ""),
+      }));
     if (!productGid) {
       await insertTranslationLog({
         shop: session.shop,
@@ -1446,6 +1501,35 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           value: string;
         } => Boolean(entry?.optionKey && entry.index > 0 && entry.value),
       );
+    const metafieldTranslations = blocks
+      .map((block) => {
+        const key = block.key.trim().toLowerCase();
+        if (!key.startsWith("mf__")) return null;
+        const matchedMetafield = productMetafields.find(
+          (metafield) => metafieldSelectValue(metafield.namespace, metafield.key) === key,
+        );
+        if (!matchedMetafield) return null;
+        const value = block.value.trim();
+        if (!value) return null;
+        return {
+          id: matchedMetafield.id,
+          namespace: matchedMetafield.namespace,
+          key: matchedMetafield.key,
+          type: matchedMetafield.type,
+          value,
+        };
+      })
+      .filter(
+        (
+          entry,
+        ): entry is {
+          id: string;
+          namespace: string;
+          key: string;
+          type: string;
+          value: string;
+        } => Boolean(entry),
+      );
 
     let appliedProductTranslations = 0;
 
@@ -1461,6 +1545,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
       let appliedDefaultProductChanges = 0;
       let appliedDefaultOptionNameChanges = 0;
+      let appliedDefaultMetafieldChanges = 0;
 
       if (Object.keys(productInput).length > 1) {
         const updateResponse = await admin.graphql(
@@ -1540,7 +1625,43 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         }
       }
 
-      if (!appliedDefaultProductChanges && !appliedDefaultOptionNameChanges) {
+      if (metafieldTranslations.length) {
+        const metafieldSetResponse = await admin.graphql(
+          `#graphql
+          mutation ProductMetafieldsSetFromTranslation($metafields: [MetafieldsSetInput!]!) {
+            metafieldsSet(metafields: $metafields) {
+              userErrors {
+                field
+                message
+              }
+            }
+          }`,
+          {
+            variables: {
+              metafields: metafieldTranslations.map((entry) => ({
+                ownerId: productGid,
+                namespace: entry.namespace,
+                key: entry.key,
+                type: entry.type || "single_line_text_field",
+                value: entry.value,
+              })),
+            },
+          },
+        );
+        const metafieldSetJson = (await metafieldSetResponse.json()) as {
+          data?: {
+            metafieldsSet?: {
+              userErrors?: Array<{ field?: string[]; message: string }>;
+            };
+          };
+        };
+        const metafieldErrors = metafieldSetJson.data?.metafieldsSet?.userErrors ?? [];
+        if (!metafieldErrors.length) {
+          appliedDefaultMetafieldChanges = metafieldTranslations.length;
+        }
+      }
+
+      if (!appliedDefaultProductChanges && !appliedDefaultOptionNameChanges && !appliedDefaultMetafieldChanges) {
         return {
           ok: false,
           intent,
@@ -1556,7 +1677,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         contentType: "product",
         action: "fetch_content",
         message:
-          appliedDefaultOptionNameChanges > 0
+          appliedDefaultMetafieldChanges > 0
+            ? `Translated content applied to default locale ${translationLocale}, including ${appliedDefaultMetafieldChanges} metafield(s).`
+            : appliedDefaultOptionNameChanges > 0
             ? `Translated content applied to default locale ${translationLocale}, including ${appliedDefaultOptionNameChanges} attribute name(s).`
             : `Translated content applied to default locale ${translationLocale} via product update.`,
         requestUid,
@@ -1568,7 +1691,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         ok: true,
         intent,
         message:
-          appliedDefaultOptionNameChanges > 0
+          appliedDefaultMetafieldChanges > 0
+            ? `Translated content applied on default locale ${translationLocale} with ${appliedDefaultMetafieldChanges} metafield(s).`
+            : appliedDefaultOptionNameChanges > 0
             ? `Translated content applied on default locale ${translationLocale} with ${appliedDefaultOptionNameChanges} attribute name(s).`
             : `Translated content applied on default locale ${translationLocale}.`,
         requests: await getLocalRequestsByShop(session.shop),
@@ -1830,7 +1955,75 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
     }
 
-    if (!appliedProductTranslations && !appliedOptionNameCount && !appliedOptionValueCount) {
+    let appliedMetafieldCount = 0;
+    for (const metafieldTranslation of metafieldTranslations) {
+      try {
+        const translatableResponse = await admin.graphql(
+          `#graphql
+          query MetafieldTranslatableContent($resourceId: ID!) {
+            translatableResource(resourceId: $resourceId) {
+              translatableContent {
+                key
+                digest
+              }
+            }
+          }`,
+          { variables: { resourceId: metafieldTranslation.id } },
+        );
+        const translatableJson = (await translatableResponse.json()) as {
+          data?: {
+            translatableResource?: {
+              translatableContent?: Array<{ key: string; digest: string }>;
+            } | null;
+          };
+        };
+        const valueDigest =
+          (translatableJson.data?.translatableResource?.translatableContent ?? []).find(
+            (entry) => entry.key === "value",
+          )?.digest ?? "";
+        if (!valueDigest) continue;
+
+        const updateResponse = await admin.graphql(
+          `#graphql
+          mutation RegisterMetafieldTranslation($resourceId: ID!, $translations: [TranslationInput!]!) {
+            translationsRegister(resourceId: $resourceId, translations: $translations) {
+              userErrors {
+                field
+                message
+              }
+            }
+          }`,
+          {
+            variables: {
+              resourceId: metafieldTranslation.id,
+              translations: [
+                {
+                  key: "value",
+                  value: metafieldTranslation.value,
+                  locale: translationLocale,
+                  translatableContentDigest: valueDigest,
+                },
+              ],
+            },
+          },
+        );
+        const updateJson = (await updateResponse.json()) as {
+          data?: {
+            translationsRegister?: {
+              userErrors?: Array<{ field?: string[]; message: string }>;
+            };
+          };
+        };
+        const userErrors = updateJson.data?.translationsRegister?.userErrors ?? [];
+        if (!userErrors.length) {
+          appliedMetafieldCount += 1;
+        }
+      } catch {
+        // Ignore individual metafield translation failures and continue.
+      }
+    }
+
+    if (!appliedProductTranslations && !appliedOptionNameCount && !appliedOptionValueCount && !appliedMetafieldCount) {
       return {
         ok: false,
         intent,
@@ -1846,7 +2039,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       contentType: "product",
       action: "fetch_content",
       message:
-        appliedOptionNameCount > 0
+        appliedMetafieldCount > 0
+          ? `Translated content fetched and applied to locale ${translationLocale}, including ${appliedMetafieldCount} metafield(s).`
+          : appliedOptionNameCount > 0
           ? `Translated content fetched and applied to locale ${translationLocale}, including ${appliedOptionNameCount} attribute name(s).`
           : appliedOptionValueCount > 0
             ? `Translated content fetched and applied to locale ${translationLocale}, including ${appliedOptionValueCount} attribute value(s).`
@@ -1860,7 +2055,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       ok: true,
       intent,
       message:
-        appliedOptionNameCount > 0
+        appliedMetafieldCount > 0
+          ? `Translated content applied for locale ${translationLocale} with ${appliedMetafieldCount} metafield(s).`
+          : appliedOptionNameCount > 0
           ? `Translated content applied for locale ${translationLocale} with ${appliedOptionNameCount} attribute name(s).`
           : appliedOptionValueCount > 0
             ? `Translated content applied for locale ${translationLocale} with ${appliedOptionValueCount} attribute value(s).`
@@ -1931,6 +2128,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           seo { title description }
           variants(first: 1) { edges { node { sku } } }
           options { name values }
+          metafields(first: 100) {
+            edges {
+              node {
+                id
+                namespace
+                key
+                value
+                type
+              }
+            }
+          }
         }
       }
     }`,
@@ -1947,6 +2155,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         seo?: { title?: string | null; description?: string | null } | null;
         variants?: { edges?: Array<{ node?: { sku?: string | null } | null }> } | null;
         options?: Array<{ name: string; values: string[] }>;
+        metafields?: {
+          edges?: Array<{
+            node?: {
+              id?: string | null;
+              namespace?: string | null;
+              key?: string | null;
+              value?: string | null;
+              type?: string | null;
+            } | null;
+          }>;
+        } | null;
       } | null>;
     };
   };
@@ -2009,6 +2228,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           seoDescription: String(category.seo?.description ?? ""),
           options: [] as Array<{ name: string; values: string[] }>,
           sku: "",
+          metafields: [] as Array<{
+            id: string;
+            namespace: string;
+            key: string;
+            value: string;
+            type: string;
+          }>,
           contentType: "category" as const,
         }))
       : selectedProducts.map((product) => ({
@@ -2019,6 +2245,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           seoDescription: String(product.seo?.description ?? ""),
           options: product.options ?? [],
           sku: product.variants?.edges?.[0]?.node?.sku ?? "",
+          metafields: (product.metafields?.edges ?? [])
+            .map((edge) => edge?.node)
+            .filter(
+              (
+                node,
+              ): node is {
+                id: string;
+                namespace: string;
+                key: string;
+                value: string;
+                type: string;
+              } =>
+                Boolean(
+                  node?.id &&
+                    node.namespace &&
+                    node.key &&
+                    typeof node.value === "string" &&
+                    TEXT_METAFIELD_TYPES.has(String(node.type ?? "")),
+                ),
+            )
+            .map((node) => ({
+              id: String(node.id),
+              namespace: String(node.namespace),
+              key: String(node.key),
+              value: String(node.value ?? ""),
+              type: String(node.type ?? ""),
+            })),
           contentType: "product" as const,
         }));
   const rowsToProcess =
@@ -2067,6 +2320,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (selectedContentType !== "category" && hasField("meta_title") && row.seoTitle.trim()) blocks.push({ key: "meta_title", name: "Meta Title", value: row.seoTitle.trim() });
     if (selectedContentType !== "category" && hasField("meta_description") && row.seoDescription.trim()) blocks.push({ key: "meta_description", name: "Meta Description", value: row.seoDescription.trim() });
     if (selectedContentType === "product" && hasField("sku") && sku.trim()) blocks.push({ key: "sku", name: "SKU", value: sku.trim() });
+
+    if (selectedContentType === "product") {
+      row.metafields.forEach((metafield) => {
+        const selectKey = metafieldSelectValue(metafield.namespace, metafield.key);
+        if (!hasField(selectKey)) return;
+        const cleanValue = String(metafield.value ?? "").trim();
+        if (!cleanValue) return;
+        blocks.push({
+          key: selectKey,
+          name: `Metafield ${metafield.namespace}.${metafield.key}`,
+          value: cleanValue,
+        });
+      });
+    }
 
     row.options.forEach((option) => {
       const safeAttr = toFieldKey(option.name);
@@ -2319,6 +2586,7 @@ export default function DashboardRoute() {
             { value: "meta_title", label: "Meta Title" },
             { value: "meta_description", label: "Meta Description" },
             { value: "sku", label: "SKU" },
+            ...discoveredAttributeFields.filter((field) => field.value.startsWith("mf__")),
             ...dynamicAttributes.map((attr) => ({ value: `prod_attr_name_${toFieldKey(attr)}`, label: `${attr} (Attribute Name)` })),
           ],
     [discoveredAttributeFields, discoveredAttributeValueFields, dynamicAttributes, selectedContentType],
@@ -2561,7 +2829,7 @@ export default function DashboardRoute() {
               </select>
               <p style={{ marginTop: "8px", color: "#6b7280", fontSize: "13px" }}>
                 {selectedContentType === "product"
-                  ? "Select fields to send for translation. Product options appear when a single product is selected."
+                  ? "Select fields to send for translation. Product options and text metafields appear here."
                   : selectedContentType === "attribute"
                     ? "Select attribute fields to send for translation."
                     : selectedContentType === "attribute_value"
