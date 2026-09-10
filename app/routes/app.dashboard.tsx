@@ -2586,11 +2586,31 @@ export default function DashboardRoute() {
             { value: "meta_title", label: "Meta Title" },
             { value: "meta_description", label: "Meta Description" },
             { value: "sku", label: "SKU" },
-            ...discoveredAttributeFields.filter((field) => field.value.startsWith("mf__")),
-            ...dynamicAttributes.map((attr) => ({ value: `prod_attr_name_${toFieldKey(attr)}`, label: `${attr} (Attribute Name)` })),
+            ...(selectedProducts.length
+              ? [
+                  ...discoveredAttributeFields.filter((field) => field.value.startsWith("mf__")),
+                  ...dynamicAttributes.map((attr) => ({
+                    value: `prod_attr_name_${toFieldKey(attr)}`,
+                    label: `${attr} (Attribute Name)`,
+                  })),
+                ]
+              : []),
           ],
-    [discoveredAttributeFields, discoveredAttributeValueFields, dynamicAttributes, selectedContentType],
+    [
+      discoveredAttributeFields,
+      discoveredAttributeValueFields,
+      dynamicAttributes,
+      selectedContentType,
+      selectedProducts.length,
+    ],
   );
+
+  useEffect(() => {
+    if (selectedContentType !== "product" || selectedProducts.length) return;
+    setSelectedFields((prev) =>
+      prev.filter((field) => !field.startsWith("mf__") && !field.startsWith("prod_attr_")),
+    );
+  }, [selectedContentType, selectedProducts.length]);
 
   const visibleRequests = useMemo(
     () => requests.filter((r) => statusFilter === "All" || r.status.toLowerCase() === statusFilter.toLowerCase()),
@@ -2829,7 +2849,9 @@ export default function DashboardRoute() {
               </select>
               <p style={{ marginTop: "8px", color: "#6b7280", fontSize: "13px" }}>
                 {selectedContentType === "product"
-                  ? "Select fields to send for translation. Product options and text metafields appear here."
+                  ? selectedProducts.length
+                    ? "Select fields to send for translation. Product options and text metafields appear for the selected product(s)."
+                    : "Select a product to see its options and text metafields."
                   : selectedContentType === "attribute"
                     ? "Select attribute fields to send for translation."
                     : selectedContentType === "attribute_value"
